@@ -46,7 +46,7 @@ export function PixelCanvas({ document, revision, onChange, onPickColor }: Props
 
     for (let y = 0; y < document.height; y++) {
       for (let x = 0; x < document.width; x++) {
-        const colorIndex = document.getPixel(x, y);
+        const colorIndex = document.getCompositePixel(x, y);
         if (colorIndex === 0) continue;
         ctx.fillStyle = document.palette[colorIndex] ?? "#ff00ff";
         ctx.fillRect(x * zoom, y * zoom, zoom, zoom);
@@ -94,12 +94,12 @@ export function PixelCanvas({ document, revision, onChange, onPickColor }: Props
     lastCell.current = key;
 
     if (tool === "picker") {
-      onPickColor(document.getPixel(x, y));
+      onPickColor(document.getCompositePixel(x, y));
       return;
     }
     if (tool === "fill") {
       const changes = document.fill(x, y, selectedColor);
-      document.commit("Fill", changes);
+      document.commit(`Fill · ${document.activeLayer.name}`, changes);
       onChange();
       drawing.current = false;
       return;
@@ -118,7 +118,8 @@ export function PixelCanvas({ document, revision, onChange, onPickColor }: Props
     drawing.current = false;
     lastCell.current = "";
     if (strokeChanges.current.length) {
-      document.commit(tool === "eraser" ? "Erase stroke" : "Pencil stroke", strokeChanges.current);
+      const label = tool === "eraser" ? "Erase stroke" : "Pencil stroke";
+      document.commit(`${label} · ${document.activeLayer.name}`, strokeChanges.current);
       strokeChanges.current = [];
       onChange();
     }

@@ -1,6 +1,13 @@
 export type Tool = "pencil" | "eraser" | "picker" | "fill";
 
-export interface PixelProjectFile {
+export interface PixelLayerFile {
+  id: string;
+  name: string;
+  visible: boolean;
+  pixels: number[];
+}
+
+export interface PixelProjectFileV1 {
   format: "efsspde-pixel-project";
   version: 1;
   width: number;
@@ -9,7 +16,27 @@ export interface PixelProjectFile {
   pixels: number[];
 }
 
+export interface PixelProjectFileV2 {
+  format: "efsspde-pixel-project";
+  version: 2;
+  width: number;
+  height: number;
+  palette: string[];
+  layers: PixelLayerFile[];
+  activeLayerId: string;
+}
+
+export type PixelProjectFile = PixelProjectFileV1 | PixelProjectFileV2;
+
+export interface PixelLayer {
+  id: string;
+  name: string;
+  visible: boolean;
+  pixels: Uint8Array;
+}
+
 export interface PixelChange {
+  layerId: string;
   index: number;
   before: number;
   after: number;
