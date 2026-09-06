@@ -1,12 +1,5 @@
 export type Tool = "pencil" | "eraser" | "picker" | "fill";
 
-export interface PixelLayerFile {
-  id: string;
-  name: string;
-  visible: boolean;
-  pixels: number[];
-}
-
 export interface PixelProjectFileV1 {
   format: "efsspde-pixel-project";
   version: 1;
@@ -16,26 +9,63 @@ export interface PixelProjectFileV1 {
   pixels: number[];
 }
 
+export interface PixelLayerFileV2 {
+  id: string;
+  name: string;
+  visible: boolean;
+  pixels: number[];
+}
+
 export interface PixelProjectFileV2 {
   format: "efsspde-pixel-project";
   version: 2;
   width: number;
   height: number;
   palette: string[];
-  layers: PixelLayerFile[];
+  layers: PixelLayerFileV2[];
   activeLayerId: string;
 }
 
-export type PixelProjectFile = PixelProjectFileV1 | PixelProjectFileV2;
+export interface PixelFrameFile {
+  id: string;
+  durationMs: number;
+}
+
+export interface PixelLayerFileV3 {
+  id: string;
+  name: string;
+  visible: boolean;
+  cels: number[][];
+}
+
+export interface PixelProjectFileV3 {
+  format: "efsspde-pixel-project";
+  version: 3;
+  width: number;
+  height: number;
+  palette: string[];
+  layers: PixelLayerFileV3[];
+  frames: PixelFrameFile[];
+  activeLayerId: string;
+  activeFrameId: string;
+}
+
+export type PixelProjectFile = PixelProjectFileV1 | PixelProjectFileV2 | PixelProjectFileV3;
+
+export interface PixelFrame {
+  id: string;
+  durationMs: number;
+}
 
 export interface PixelLayer {
   id: string;
   name: string;
   visible: boolean;
-  pixels: Uint8Array;
+  cels: Uint8Array[];
 }
 
 export interface PixelChange {
+  frameId: string;
   layerId: string;
   index: number;
   before: number;

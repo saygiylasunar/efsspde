@@ -1,6 +1,6 @@
 [package]
 name = "efsspde"
-version = "0.2.0"
+version = "0.3.0"
 description = "EFSS Pixel Discipline Editor"
 authors = ["Ersen Filiz Saygıyla Sunar"]
 edition = "2021"
