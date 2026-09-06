@@ -59,6 +59,72 @@ def _parse_palette(text: str) -> PaletteSpec:
 def _palette_on(palette: PaletteSpec, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     return palette.rgba.to(device=device, dtype=dtype)
 
+def _palette_from_rgb(rgb: torch.Tensor) -> PaletteSpec:
+    rgb = rgb.detach().to(dtype=torch.float32).clamp(0.0, 1.0)
+    luma = rgb[:, 0] * 0.299 + rgb[:, 1] * 0.587 + rgb[:, 2] * 0.114
+    order = torch.argsort(luma)
+    rgb = rgb[order]
+
+    rgba = torch.cat(
+        [rgb, torch.ones((rgb.shape[0], 1), device=rgb.device, dtype=rgb.dtype)],
+        dim=1,
+    )
+    values = (rgb * 255.0).round().to(dtype=torch.uint8).cpu().tolist()
+    colors = tuple(f"#{r:02X}{g:02X}{b:02X}" for r, g, b in values)
+    return PaletteSpec(colors, rgba, -1)
+
+
+def _extract_palette_kmeans(
+    image: torch.Tensor,
+    color_count: int,
+    iterations: int,
+    sample_limit: int,
+) -> PaletteSpec:
+    _validate_image(image)
+    flat = image.reshape(-1, 3).to(dtype=torch.float32).clamp(0.0, 1.0)
+
+    if flat.shape[0] > sample_limit:
+        positions = torch.linspace(
+            0,
+            flat.shape[0] - 1,
+            steps=sample_limit,
+            device=flat.device,
+        ).round().to(dtype=torch.long)
+        flat = flat[positions]
+
+    k = max(2, min(int(color_count), int(flat.shape[0])))
+
+    mean = flat.mean(dim=0, keepdim=True)
+    first_index = ((flat - mean) ** 2).sum(dim=1).argmin()
+    centroids = [flat[first_index]]
+    min_distance = ((flat - centroids[0]) ** 2).sum(dim=1)
+
+    for _ in range(1, k):
+        next_index = min_distance.argmax()
+        next_centroid = flat[next_index]
+        centroids.append(next_centroid)
+        distance = ((flat - next_centroid) ** 2).sum(dim=1)
+        min_distance = torch.minimum(min_distance, distance)
+
+    centers = torch.stack(centroids, dim=0)
+
+    for _ in range(iterations):
+        distances = ((flat[:, None, :] - centers[None, :, :]) ** 2).sum(dim=-1)
+        labels = distances.argmin(dim=1)
+        updated = centers.clone()
+
+        for index in range(k):
+            members = flat[labels == index]
+            if members.numel() > 0:
+                updated[index] = members.mean(dim=0)
+
+        if torch.max(torch.abs(updated - centers)).item() < 1e-5:
+            centers = updated
+            break
+        centers = updated
+
+    return _palette_from_rgb(centers)
+
 
 def _validate_image(image: torch.Tensor) -> None:
     if image.ndim != 4 or image.shape[-1] != 3:
@@ -194,6 +260,52 @@ class EFSSPalette:
 
     def build(self, palette_text: str):
         palette = _parse_palette(palette_text)
+        return (palette, len(palette.hex_colors), "\n".join(palette.hex_colors))
+
+
+class EFSSAutoPalette:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "color_count": ("INT", {"default": 16, "min": 2, "max": 64, "step": 1}),
+                "target_width": ("INT", {"default": 32, "min": 1, "max": 2048, "step": 1}),
+                "target_height": ("INT", {"default": 32, "min": 1, "max": 2048, "step": 1}),
+                "iterations": ("INT", {"default": 8, "min": 1, "max": 32, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("EFSS_PALETTE", "INT", "STRING")
+    RETURN_NAMES = ("palette", "color_count", "normalized_hex")
+    FUNCTION = "extract"
+    CATEGORY = "EFSS PDE/Pixel"
+
+    def extract(
+        self,
+        image: torch.Tensor,
+        color_count: int,
+        target_width: int,
+        target_height: int,
+        iterations: int,
+    ):
+        _validate_image(image)
+
+        # Extract colors from the same logical scale used by Pixel Map, not from
+        # high-frequency VAE texture that will disappear during pixel mapping.
+        bchw = image.permute(0, 3, 1, 2)
+        logical = F.interpolate(
+            bchw,
+            size=(target_height, target_width),
+            mode="area",
+        ).permute(0, 2, 3, 1).contiguous()
+
+        palette = _extract_palette_kmeans(
+            logical,
+            color_count=color_count,
+            iterations=iterations,
+            sample_limit=16_384,
+        )
         return (palette, len(palette.hex_colors), "\n".join(palette.hex_colors))
 
 
@@ -347,6 +459,7 @@ class EFSSPixelPreview:
 NODE_CLASS_MAPPINGS = {
     "EFSSPDE_PixelCanvas": EFSSPixelCanvas,
     "EFSSPDE_Palette": EFSSPalette,
+    "EFSSPDE_AutoPalette": EFSSAutoPalette,
     "EFSSPDE_PixelMap": EFSSPixelMap,
     "EFSSPDE_PixelGuide": EFSSPixelGuide,
     "EFSSPDE_PixelPreview": EFSSPixelPreview,
@@ -355,6 +468,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "EFSSPDE_PixelCanvas": "EFSS Pixel Canvas",
     "EFSSPDE_Palette": "EFSS Palette",
+    "EFSSPDE_AutoPalette": "EFSS Auto Palette",
     "EFSSPDE_PixelMap": "EFSS Pixel Map",
     "EFSSPDE_PixelGuide": "EFSS Pixel Guide",
     "EFSSPDE_PixelPreview": "EFSS Pixel Preview",

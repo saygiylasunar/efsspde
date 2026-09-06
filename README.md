@@ -7,7 +7,8 @@ This branch intentionally contains **only the ComfyUI node package**. It does no
 ## Nodes
 
 - **EFSS Pixel Canvas** — maps a native target grid to an integer-aligned generation canvas.
-- **EFSS Palette** — defines an exact 2–256 color palette contract.
+- **EFSS Palette** — optional manual 2–256 color palette contract.
+- **EFSS Auto Palette** — extracts a deterministic palette from the decoded image at the logical target scale.
 - **EFSS Pixel Map** — maps a decoded Comfy `IMAGE` to the exact target grid and exact palette indices.
 - **EFSS Pixel Guide** — conservative deterministic neighborhood cleanup on indexed pixels.
 - **EFSS Pixel Preview** — integer nearest-neighbor preview scaling.
@@ -19,16 +20,18 @@ Prompt / Conditioning
         ↓
 Model / Sampler
         ↓
-VAE Decode
-        ↓
-EFSS Pixel Map ← EFSS Palette
-        ↓
-EFSS Pixel Guide
-        ↓
-native pixel output
-        ↓
-EFSS Pixel Preview / Save Image
+VAE Decode ─────→ EFSS Auto Palette
+        │                 │
+        └────────────→ EFSS Pixel Map
+                          ↓
+                   EFSS Pixel Guide
+                          ↓
+                  native pixel output
+                          ↓
+             EFSS Pixel Preview / Save Image
 ```
+
+If you already have an art-directed palette, replace **EFSS Auto Palette** with the manual **EFSS Palette** node.
 
 `EFSS Pixel Canvas` can be used earlier in the workflow to calculate generation dimensions from a native target size and integer cell scale.
 
