@@ -1,0 +1,10 @@
+[project]
+name = "efsspde-nodes"
+version = "0.1.0"
+description = "Deterministic pixel mapping and guiding nodes for EFSS PDE workflows."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/saygiylasunar/efsspde"
+Documentation = "https://github.com/saygiylasunar/efsspde/tree/feat/m4-1-comfy-node-pack/comfy_nodes/efsspde_nodes"

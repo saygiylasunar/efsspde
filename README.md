@@ -4,6 +4,24 @@
 
 EFSS PDE is a deterministic, grid-first pixel-art editor aimed at game-ready assets and AI-operable editing workflows.
 
+## M4.1 — ComfyUI Pixel Node Pack
+
+The first Comfy package lives under `comfy_nodes/efsspde_nodes` and currently provides:
+
+- **EFSS Pixel Canvas** — target-grid → aligned generation canvas
+- **EFSS Palette** — exact indexed palette contract
+- **EFSS Pixel Map** — decoded Comfy IMAGE → native target grid + exact palette indices
+- **EFSS Pixel Guide** — conservative deterministic cluster cleanup
+- **EFSS Pixel Preview** — integer nearest-neighbor preview
+
+Windows portable install from this monorepo:
+
+```powershell
+.\\scripts\\install_comfy_nodes.ps1 -ComfyRoot "D:\\ComfyUI_windows_portable"
+```
+
+See [the node pack README](comfy_nodes/efsspde_nodes/README.md).
+
 ## M4 — Operator Bridge
 
 M4 adds the runtime line between the open editor and an MCP-capable operator.
