@@ -88,7 +88,7 @@ export default function App() {
   const saveProject = () => {
     const json = JSON.stringify(pixelDocument.toProject(), null, 2);
     downloadBlob(new Blob([json], { type: "application/json" }), "untitled.efsspde.json");
-    setStatus("Project saved");
+    setStatus("Project v2 saved");
   };
 
   const loadProject = async (file: File) => {
@@ -98,7 +98,7 @@ export default function App() {
       setWidth(pixelDocument.width);
       setHeight(pixelDocument.height);
       if (selectedColor >= pixelDocument.palette.length) setSelectedColor(1);
-      setStatus(`Loaded ${file.name}`);
+      setStatus(`Loaded ${file.name} · ${pixelDocument.layerCount} layer(s)`);
       refresh();
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Could not load project");
@@ -114,7 +114,7 @@ export default function App() {
     ctx.imageSmoothingEnabled = false;
     for (let y = 0; y < pixelDocument.height; y++) {
       for (let x = 0; x < pixelDocument.width; x++) {
-        const index = pixelDocument.getPixel(x, y);
+        const index = pixelDocument.getCompositePixel(x, y);
         if (index === 0) continue;
         ctx.fillStyle = pixelDocument.palette[index];
         ctx.fillRect(x, y, 1, 1);
@@ -123,16 +123,37 @@ export default function App() {
     canvas.toBlob((blob) => {
       if (blob) downloadBlob(blob, "untitled.png");
     }, "image/png");
-    setStatus(`PNG exported at native ${pixelDocument.width}×${pixelDocument.height}`);
+    setStatus(`Composite PNG exported · ${pixelDocument.width}×${pixelDocument.height}`);
   };
 
   const runCommand = () => {
     try {
       const result = executePixelCommandJson(pixelDocument, commandText);
-      setStatus(formatCommandResult(result));
+      setStatus(`${formatCommandResult(result)} · ${pixelDocument.activeLayer.name}`);
       refresh();
     } catch (error) {
       setStatus(error instanceof Error ? `Command error: ${error.message}` : "Command failed");
+    }
+  };
+
+  const addLayer = () => {
+    const layer = pixelDocument.addLayer();
+    setStatus(`Added ${layer.name}`);
+    refresh();
+  };
+
+  const deleteLayer = () => {
+    const name = pixelDocument.activeLayer.name;
+    if (pixelDocument.deleteLayer(pixelDocument.activeLayerId)) {
+      setStatus(`Deleted ${name}`);
+      refresh();
+    }
+  };
+
+  const moveLayer = (direction: "up" | "down") => {
+    if (pixelDocument.moveLayer(pixelDocument.activeLayerId, direction)) {
+      setStatus(`Moved ${pixelDocument.activeLayer.name} ${direction}`);
+      refresh();
     }
   };
 
@@ -141,7 +162,7 @@ export default function App() {
       <header className="topbar">
         <div className="brand">
           <strong>EFSS PDE</strong>
-          <span>Pixel Discipline Editor · M1 Command Engine</span>
+          <span>Pixel Discipline Editor · M2 Layers</span>
         </div>
         <div className="top-actions">
           <label className="size-field">W <input value={width} type="number" min="1" max="512" onChange={(e) => setWidth(Number(e.target.value))} /></label>
@@ -175,7 +196,7 @@ export default function App() {
           <div className="separator" />
           <button disabled={!pixelDocument.canUndo} onClick={() => { if (pixelDocument.undo()) refresh(); }}>Undo <kbd>Ctrl Z</kbd></button>
           <button disabled={!pixelDocument.canRedo} onClick={() => { if (pixelDocument.redo()) refresh(); }}>Redo <kbd>Ctrl Y</kbd></button>
-          <button onClick={() => { pixelDocument.clear(); setStatus("Canvas cleared"); refresh(); }}>Clear</button>
+          <button onClick={() => { pixelDocument.clear(); setStatus(`Cleared ${pixelDocument.activeLayer.name}`); refresh(); }}>Clear layer</button>
         </aside>
 
         <section className="canvas-stage">
@@ -211,9 +232,39 @@ export default function App() {
             </div>
           </section>
 
+          <section className="layers-panel">
+            <div className="panel-title">LAYERS</div>
+            <div className="layer-toolbar">
+              <button onClick={addLayer}>+ Layer</button>
+              <button disabled={pixelDocument.layerCount <= 1} onClick={deleteLayer}>Delete</button>
+              <button onClick={() => moveLayer("up")}>↑</button>
+              <button onClick={() => moveLayer("down")}>↓</button>
+            </div>
+            <div className="layer-list">
+              {[...pixelDocument.layers].reverse().map((layer) => (
+                <div key={layer.id} className={`layer-row ${pixelDocument.activeLayerId === layer.id ? "selected" : ""}`}>
+                  <button
+                    className="visibility-button"
+                    title={layer.visible ? "Hide layer" : "Show layer"}
+                    onClick={() => { pixelDocument.toggleLayerVisibility(layer.id); refresh(); }}
+                  >
+                    {layer.visible ? "●" : "○"}
+                  </button>
+                  <button
+                    className="layer-name"
+                    onClick={() => { pixelDocument.setActiveLayer(layer.id); setStatus(`Active: ${layer.name}`); refresh(); }}
+                  >
+                    {layer.name}
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div className="layer-note">Commands and drawing affect the active layer. Render and PNG export use the visible composite.</div>
+          </section>
+
           <section className="command-lab">
             <div className="panel-title">COMMAND ENGINE</div>
-            <p>Deterministic JSON operations. A batch is committed as one undoable transaction.</p>
+            <p>Deterministic JSON operations run against the active layer as one undoable transaction.</p>
             <textarea
               value={commandText}
               onChange={(event) => setCommandText(event.target.value)}
@@ -232,6 +283,7 @@ export default function App() {
       <footer className="statusbar">
         <span>{status}</span>
         <div className="status-actions">
+          <span className="active-layer-status">{pixelDocument.activeLayer.name}</span>
           <button className={gridVisible ? "active" : ""} onClick={toggleGrid}>Grid</button>
           {[4, 8, 12, 16, 24, 32].map((value) => (
             <button key={value} className={zoom === value ? "active" : ""} onClick={() => setZoom(value)}>{value}×</button>

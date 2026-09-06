@@ -4,11 +4,21 @@
 
 EFSS PDE is a deterministic, grid-first pixel-art editor aimed at game-ready assets and AI-operable editing workflows. The editor treats pixels as indexed data instead of asking a generative image model to imitate pixel art.
 
+## M2 — Layers and compositing
+
+M2 upgrades the document model from one pixel buffer to an ordered layer stack.
+
+- Add, select, delete, show/hide and reorder layers
+- Topmost visible non-transparent pixel wins during compositing
+- Drawing and Command Engine operations target the active layer
+- PNG export uses the visible composite
+- Undo/redo changes carry `layerId`, so history remains correct after layer switching
+- Project format upgraded to v2 with automatic v1 migration
+- Existing M0/M1 project JSON remains loadable
+
 ## M1 — Command Engine
 
-M1 introduces the deterministic operation layer that human UI actions and future AI operators can share.
-
-Supported operations:
+Supported deterministic operations:
 
 - `set_pixel`
 - `clear_pixel`
@@ -21,27 +31,6 @@ Supported operations:
 
 Commands are validated before execution. JSON arrays run as one transaction, produce a pixel-diff summary and can be reverted with one Undo.
 
-Example:
-
-```json
-[
-  {
-    "op": "paint_stroke",
-    "color": 5,
-    "points": [
-      { "x": 8, "y": 10 },
-      { "x": 9, "y": 10 }
-    ]
-  },
-  {
-    "op": "set_pixel",
-    "x": 9,
-    "y": 11,
-    "color": 6
-  }
-]
-```
-
 ## M0 — First Pixel
 
 - Native indexed pixel canvas
@@ -50,11 +39,10 @@ Example:
 - Integer zoom and optional pixel grid
 - Stroke-based undo / redo
 - Native-resolution PNG export
-- JSON project save / load
 - React + TypeScript + Vite frontend
 - Tauri 2 desktop shell
 - Zustand UI state
-- `Uint8Array` pixel buffer
+- `Uint8Array` pixel buffers
 
 ## Development
 
@@ -63,13 +51,13 @@ npm install
 npm run dev
 ```
 
-Desktop development:
+Desktop:
 
 ```bash
 npm run tauri:dev
 ```
 
-Production frontend build:
+Build:
 
 ```bash
 npm run build
@@ -77,7 +65,6 @@ npm run build
 
 ## Roadmap
 
-- **M2:** Layers and compositing
 - **M3:** Frames, animation and onion skin
 - **M4:** Semantic regions, anchors and deterministic AI operator bridge
 - **M5:** Pixel linting, isometric constraints and discipline profiles
