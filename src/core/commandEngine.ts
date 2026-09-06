@@ -9,6 +9,11 @@ import { PixelDocument } from "./pixelDocument";
 
 type UnknownRecord = Record<string, unknown>;
 
+export interface ExecutePixelCommandOptions {
+  label?: string;
+  commit?: boolean;
+}
+
 function asRecord(value: unknown, name: string): UnknownRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`${name} must be an object.`);
@@ -197,11 +202,12 @@ function applyOperation(document: PixelDocument, operation: PixelOperation): Pix
 }
 
 function summarize(label: string, operations: number, changes: PixelChange[]): CommandExecutionResult {
-  const unique = new Map<number, PixelChange>();
+  const unique = new Map<string, PixelChange>();
   for (const change of changes) {
-    const existing = unique.get(change.index);
+    const key = `${change.frameId}:${change.layerId}:${change.index}`;
+    const existing = unique.get(key);
     if (existing) existing.after = change.after;
-    else unique.set(change.index, { ...change });
+    else unique.set(key, { ...change });
   }
 
   let changedPixels = 0;
@@ -223,8 +229,12 @@ function summarize(label: string, operations: number, changes: PixelChange[]): C
 export function executePixelCommands(
   document: PixelDocument,
   input: unknown,
-  label = "Command Engine",
+  options: ExecutePixelCommandOptions | string = {},
 ): CommandExecutionResult {
+  const normalized = typeof options === "string" ? { label: options } : options;
+  const label = normalized.label ?? "Command Engine";
+  const commit = normalized.commit ?? true;
+
   const rawCommands = Array.isArray(input) ? input : [input];
   if (rawCommands.length === 0) throw new Error("Command batch cannot be empty.");
 
@@ -234,15 +244,18 @@ export function executePixelCommands(
   try {
     for (const operation of operations) changes.push(...applyOperation(document, operation));
   } catch (error) {
-    for (let index = changes.length - 1; index >= 0; index--) {
-      const change = changes[index];
-      document.pixels[change.index] = change.before;
-    }
+    document.rollbackChanges(changes);
     throw error;
   }
 
-  document.commit(label, changes);
-  return summarize(label, operations.length, changes);
+  const result = summarize(label, operations.length, changes);
+  if (commit) document.commit(label, changes);
+  else document.rollbackChanges(changes);
+  return result;
+}
+
+export function previewPixelCommands(document: PixelDocument, input: unknown, label = "Preview") {
+  return executePixelCommands(document, input, { label, commit: false });
 }
 
 export function executePixelCommandJson(document: PixelDocument, json: string) {
