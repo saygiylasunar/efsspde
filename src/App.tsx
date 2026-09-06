@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { PixelCanvas } from "./components/PixelCanvas";
+import { executePixelCommandJson, formatCommandResult } from "./core/commandEngine";
 import { PixelDocument } from "./core/pixelDocument";
 import { useEditorStore } from "./store/editorStore";
 import type { PixelProjectFile, Tool } from "./types";
@@ -10,6 +11,15 @@ const TOOLS: Array<{ id: Tool; label: string; key: string }> = [
   { id: "picker", label: "Picker", key: "I" },
   { id: "fill", label: "Fill", key: "F" },
 ];
+
+const COMMAND_EXAMPLE = `[
+  { "op": "paint_stroke", "color": 5, "points": [
+    { "x": 8, "y": 10 },
+    { "x": 9, "y": 10 },
+    { "x": 10, "y": 10 }
+  ]},
+  { "op": "set_pixel", "x": 9, "y": 11, "color": 6 }
+]`;
 
 function downloadBlob(blob: Blob, name: string) {
   const url = URL.createObjectURL(blob);
@@ -26,6 +36,7 @@ export default function App() {
   const [width, setWidth] = useState(pixelDocument.width);
   const [height, setHeight] = useState(pixelDocument.height);
   const [status, setStatus] = useState("Ready");
+  const [commandText, setCommandText] = useState(COMMAND_EXAMPLE);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const {
@@ -115,12 +126,22 @@ export default function App() {
     setStatus(`PNG exported at native ${pixelDocument.width}×${pixelDocument.height}`);
   };
 
+  const runCommand = () => {
+    try {
+      const result = executePixelCommandJson(pixelDocument, commandText);
+      setStatus(formatCommandResult(result));
+      refresh();
+    } catch (error) {
+      setStatus(error instanceof Error ? `Command error: ${error.message}` : "Command failed");
+    }
+  };
+
   return (
     <main className="app-shell">
       <header className="topbar">
         <div className="brand">
           <strong>EFSS PDE</strong>
-          <span>Pixel Discipline Editor · M0</span>
+          <span>Pixel Discipline Editor · M1 Command Engine</span>
         </div>
         <div className="top-actions">
           <label className="size-field">W <input value={width} type="number" min="1" max="512" onChange={(e) => setWidth(Number(e.target.value))} /></label>
@@ -168,25 +189,43 @@ export default function App() {
           </div>
         </section>
 
-        <aside className="panel palette-panel">
-          <div className="panel-title">PALETTE</div>
-          <div className="palette-grid">
-            {pixelDocument.palette.map((color, index) => (
-              <button
-                key={`${color}-${index}`}
-                className={`swatch ${selectedColor === index ? "selected" : ""}`}
-                style={{ background: index === 0 ? undefined : color }}
-                title={index === 0 ? "Transparent" : `${index}: ${color}`}
-                onClick={() => setSelectedColor(index)}
-              >
-                {index === 0 ? "×" : ""}
-              </button>
-            ))}
-          </div>
-          <div className="color-readout">
-            <span>Index</span><strong>{selectedColor}</strong>
-            <span>Color</span><code>{pixelDocument.palette[selectedColor]}</code>
-          </div>
+        <aside className="panel inspector-panel">
+          <section>
+            <div className="panel-title">PALETTE</div>
+            <div className="palette-grid">
+              {pixelDocument.palette.map((color, index) => (
+                <button
+                  key={`${color}-${index}`}
+                  className={`swatch ${selectedColor === index ? "selected" : ""}`}
+                  style={{ background: index === 0 ? undefined : color }}
+                  title={index === 0 ? "Transparent" : `${index}: ${color}`}
+                  onClick={() => setSelectedColor(index)}
+                >
+                  {index === 0 ? "×" : ""}
+                </button>
+              ))}
+            </div>
+            <div className="color-readout">
+              <span>Index</span><strong>{selectedColor}</strong>
+              <span>Color</span><code>{pixelDocument.palette[selectedColor]}</code>
+            </div>
+          </section>
+
+          <section className="command-lab">
+            <div className="panel-title">COMMAND ENGINE</div>
+            <p>Deterministic JSON operations. A batch is committed as one undoable transaction.</p>
+            <textarea
+              value={commandText}
+              onChange={(event) => setCommandText(event.target.value)}
+              spellCheck={false}
+              aria-label="Pixel command JSON"
+            />
+            <div className="command-actions">
+              <button onClick={() => setCommandText(COMMAND_EXAMPLE)}>Example</button>
+              <button className="primary" onClick={runCommand}>Apply Command</button>
+            </div>
+            <div className="op-list">set_pixel · clear_pixel · paint_stroke · fill · move_region · replace_color · flip_x · flip_y</div>
+          </section>
         </aside>
       </section>
 
