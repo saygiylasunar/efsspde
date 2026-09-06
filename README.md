@@ -10,6 +10,7 @@ This branch intentionally contains **only the ComfyUI node package**. It does no
 - **EFSS Palette** — optional manual 2–256 color palette contract.
 - **EFSS Auto Palette** — extracts a deterministic palette from the decoded image at the logical target scale.
 - **EFSS Pixel Map** — maps a decoded Comfy `IMAGE` to the exact target grid and exact palette indices.
+- Logical sampling modes: **medoid** (recommended), **area**, and **nearest**.
 - **EFSS Pixel Guide** — conservative deterministic neighborhood cleanup on indexed pixels.
 - **EFSS Pixel Preview** — integer nearest-neighbor preview scaling.
 
@@ -64,3 +65,19 @@ strict native-grid output
 ```
 
 Editor UI, Tauri, MCP connectivity, prompt orchestration and other EFSS PDE application code belong elsewhere.
+
+
+## Logical sampling
+
+### medoid
+Recommended default for strict pixel work. Each logical target cell chooses the real source pixel closest to that cell's mean RGB. This preserves cell-level structure without inventing an averaged color.
+
+`medoid` requires source width and height to be exact integer multiples of the target grid. This is intentional: generated canvases should normally be derived from **EFSS Pixel Canvas**.
+
+### area
+Averages each target cell. Stable for photographic reduction, but may create intermediate colors that never existed in the source.
+
+### nearest
+Takes a single source sample. Fast and crisp, but can miss thin features depending on sampling position.
+
+Auto Palette and Pixel Map should normally use the **same sampling mode and target dimensions**.

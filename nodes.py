@@ -131,6 +131,77 @@ def _validate_image(image: torch.Tensor) -> None:
         raise ValueError(f"Expected Comfy IMAGE [B,H,W,3], got {tuple(image.shape)}")
 
 
+def _resample_logical(
+    image: torch.Tensor,
+    target_width: int,
+    target_height: int,
+    mode: str,
+) -> torch.Tensor:
+    _validate_image(image)
+    _, source_height, source_width, _ = image.shape
+
+    if target_width <= 0 or target_height <= 0:
+        raise ValueError("Target dimensions must be positive.")
+
+    bchw = image.permute(0, 3, 1, 2)
+
+    if mode == "area":
+        sampled = F.interpolate(
+            bchw,
+            size=(target_height, target_width),
+            mode="area",
+        )
+        return sampled.permute(0, 2, 3, 1).contiguous().clamp(0.0, 1.0)
+
+    if mode == "nearest":
+        sampled = F.interpolate(
+            bchw,
+            size=(target_height, target_width),
+            mode="nearest",
+        )
+        return sampled.permute(0, 2, 3, 1).contiguous().clamp(0.0, 1.0)
+
+    if mode == "medoid":
+        if source_width % target_width != 0 or source_height % target_height != 0:
+            raise ValueError(
+                "medoid sampling requires source dimensions to be exact integer multiples "
+                f"of the target grid; got {source_width}x{source_height} -> "
+                f"{target_width}x{target_height}."
+            )
+
+        cell_width = source_width // target_width
+        cell_height = source_height // target_height
+
+        # [B,H,W,C] -> [B,target_h,target_w,cell_h*cell_w,C]
+        blocks = (
+            image.reshape(
+                image.shape[0],
+                target_height,
+                cell_height,
+                target_width,
+                cell_width,
+                3,
+            )
+            .permute(0, 1, 3, 2, 4, 5)
+            .reshape(
+                image.shape[0],
+                target_height,
+                target_width,
+                cell_height * cell_width,
+                3,
+            )
+        )
+
+        mean = blocks.mean(dim=3, keepdim=True)
+        distance = ((blocks - mean) ** 2).sum(dim=-1)
+        choice = distance.argmin(dim=3, keepdim=True)
+        gather_index = choice.unsqueeze(-1).expand(-1, -1, -1, 1, 3)
+        sampled = torch.gather(blocks, dim=3, index=gather_index).squeeze(3)
+        return sampled.contiguous().clamp(0.0, 1.0)
+
+    raise ValueError(f"Unsupported logical sampling mode: {mode}")
+
+
 def _indexed_payload(indices: torch.Tensor, palette: PaletteSpec) -> dict[str, Any]:
     return {
         "version": 1,
@@ -272,6 +343,7 @@ class EFSSAutoPalette:
                 "color_count": ("INT", {"default": 16, "min": 2, "max": 64, "step": 1}),
                 "target_width": ("INT", {"default": 32, "min": 1, "max": 2048, "step": 1}),
                 "target_height": ("INT", {"default": 32, "min": 1, "max": 2048, "step": 1}),
+                "sampling": (["medoid", "area", "nearest"], {"default": "medoid"}),
                 "iterations": ("INT", {"default": 8, "min": 1, "max": 32, "step": 1}),
             }
         }
@@ -287,18 +359,17 @@ class EFSSAutoPalette:
         color_count: int,
         target_width: int,
         target_height: int,
+        sampling: str,
         iterations: int,
     ):
-        _validate_image(image)
-
-        # Extract colors from the same logical scale used by Pixel Map, not from
-        # high-frequency VAE texture that will disappear during pixel mapping.
-        bchw = image.permute(0, 3, 1, 2)
-        logical = F.interpolate(
-            bchw,
-            size=(target_height, target_width),
-            mode="area",
-        ).permute(0, 2, 3, 1).contiguous()
+        # Extract colors from the same logical representation used by Pixel Map,
+        # not from high-frequency VAE texture that disappears during mapping.
+        logical = _resample_logical(
+            image,
+            target_width=target_width,
+            target_height=target_height,
+            mode=sampling,
+        )
 
         palette = _extract_palette_kmeans(
             logical,
@@ -318,7 +389,7 @@ class EFSSPixelMap:
                 "palette": ("EFSS_PALETTE",),
                 "target_width": ("INT", {"default": 32, "min": 1, "max": 2048, "step": 1}),
                 "target_height": ("INT", {"default": 32, "min": 1, "max": 2048, "step": 1}),
-                "downsample": (["area", "nearest"], {"default": "area"}),
+                "downsample": (["medoid", "area", "nearest"], {"default": "medoid"}),
                 "distance_metric": (["luma_weighted", "rgb"], {"default": "luma_weighted"}),
             }
         }
@@ -337,13 +408,12 @@ class EFSSPixelMap:
         downsample: str,
         distance_metric: str,
     ):
-        _validate_image(image)
-        bchw = image.permute(0, 3, 1, 2)
-        if downsample == "area":
-            sampled = F.interpolate(bchw, size=(target_height, target_width), mode="area")
-        else:
-            sampled = F.interpolate(bchw, size=(target_height, target_width), mode="nearest")
-        sampled = sampled.permute(0, 2, 3, 1).contiguous().clamp(0.0, 1.0)
+        sampled = _resample_logical(
+            image,
+            target_width=target_width,
+            target_height=target_height,
+            mode=downsample,
+        )
 
         indices = _nearest_palette_indices(sampled, palette, distance_metric)
         pixel_image = _render_indices(indices, palette).to(dtype=image.dtype)
