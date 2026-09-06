@@ -1,27 +1,36 @@
 {
   "name": "efsspde",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && tsc -p bridge/tsconfig.json --noEmit && vite build",
     "preview": "vite preview",
+    "bridge": "tsx bridge/server.ts",
+    "bridge:check": "tsc -p bridge/tsconfig.json --noEmit",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"
   },
   "dependencies": {
+    "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
     "@tauri-apps/api": "^2.8.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
+    "ws": "^8.18.3",
+    "zod": "^4.2.0",
     "zustand": "^5.0.8"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.8.4",
+    "@types/node": "^24.3.0",
     "@types/react": "^19.1.12",
     "@types/react-dom": "^19.1.9",
+    "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^5.0.2",
+    "tsx": "^4.20.5",
     "typescript": "^5.9.2",
     "vite": "^7.1.4"
   }

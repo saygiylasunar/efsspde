@@ -4,29 +4,76 @@
 
 EFSS PDE is a deterministic, grid-first pixel-art editor aimed at game-ready assets and AI-operable editing workflows.
 
+## M4 — Operator Bridge
+
+M4 adds the runtime line between the open editor and an MCP-capable operator.
+
+```text
+ChatGPT / MCP client
+        │
+        │ Streamable HTTP
+        ▼
+127.0.0.1:8787/mcp
+   Operator Bridge
+        │
+        │ authenticated WebSocket
+        ▼
+EFSS PDE runtime
+        │
+        ▼
+Pixel Command Engine
+```
+
+The bridge exposes:
+
+- `pde_get_state` — canvas, palette, layers, frames, active context
+- `pde_get_frame` — composited native palette-index pixels
+- `pde_preview_operations` — simulate operations and return a diff without committing
+- `pde_execute_operations` — execute one undoable deterministic transaction
+- `pde_set_context` — select a known frame/layer
+- `pde_undo`
+- `pde_redo`
+
+The MCP server follows the 2026-era TypeScript SDK and Streamable HTTP model. The editor connects to the bridge over a token-authenticated WebSocket. The bridge binds to loopback by default.
+
+### Start the runtime bridge
+
+```bash
+npm install
+npm run bridge
+```
+
+The bridge prints a one-time editor token when `EFSS_EDITOR_TOKEN` is not set. Paste that token into **Operator Bridge → Editor token** in EFSS PDE and press **Connect**.
+
+Default endpoints:
+
+```text
+MCP:       http://127.0.0.1:8787/mcp
+Health:    http://127.0.0.1:8787/health
+Editor WS: ws://127.0.0.1:8787/editor
+```
+
+For local development, keep the bridge bound to `127.0.0.1`. A remote MCP client cannot reach localhost directly; use a trusted MCP tunnel or deploy the bridge behind HTTPS. If you bind the bridge publicly, configure both `EFSS_EDITOR_TOKEN` and `EFSS_MCP_TOKEN`.
+
+See [bridge/README.md](bridge/README.md).
+
 ## M3 — Frames, animation and onion skin
 
-M3 turns the layer stack into an animation-capable cel model.
-
-- Every layer owns one indexed cel per frame
-- Add blank frames or duplicate the active frame
-- Delete frames while preserving at least one frame
-- Per-frame duration from 20–5000 ms
-- Playback uses each frame's own duration
+- Per-layer cels for every frame
+- Blank/duplicate/delete frame
+- Per-frame duration
+- Variable-duration playback
 - Previous/next frame onion skin
-- Pixel history now keys changes by `frameId + layerId + pixelIndex`
-- Project format v3 with automatic v1/v2 migration
-- PNG export targets the active composited frame
-- Drawing and Command Engine are locked during playback
+- Frame + layer aware history
+- Project v3 with v1/v2 migration
 
 ## M2 — Layers and compositing
 
-- Add, select, delete, show/hide and reorder layers
-- Visible topmost non-transparent pixel wins during compositing
-- Drawing and Command Engine operations target the active layer
-- PNG export uses the visible composite
+- Add/select/delete/show-hide/reorder layers
+- Visible topmost-pixel compositing
+- Active-layer editing
+- Composite PNG export
 - Layer-aware undo/redo
-- Project format v2 with automatic v1 migration
 
 ## M1 — Command Engine
 
@@ -44,7 +91,7 @@ Deterministic operations:
 ## M0 — First Pixel
 
 - Native indexed pixel canvas
-- Pencil, eraser, picker and flood fill
+- Pencil, eraser, picker and fill
 - Indexed palette
 - Integer zoom and pixel grid
 - Undo / redo
@@ -67,7 +114,7 @@ Desktop:
 npm run tauri:dev
 ```
 
-Build:
+Full build/type-check, including the Operator Bridge:
 
 ```bash
 npm run build
@@ -75,5 +122,5 @@ npm run build
 
 ## Roadmap
 
-- **M4:** Semantic regions, anchors and deterministic AI operator bridge
+- **M4.1:** Semantic regions and anchors on top of the runtime bridge
 - **M5:** Pixel linting, isometric constraints and discipline profiles
