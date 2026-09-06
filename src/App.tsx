@@ -37,37 +37,27 @@ export default function App() {
   const [height, setHeight] = useState(pixelDocument.height);
   const [status, setStatus] = useState("Ready");
   const [commandText, setCommandText] = useState(COMMAND_EXAMPLE);
+  const [onionSkin, setOnionSkin] = useState(true);
+  const [playing, setPlaying] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const {
-    tool,
-    zoom,
-    gridVisible,
-    selectedColor,
-    setTool,
-    setZoom,
-    toggleGrid,
-    setSelectedColor,
-  } = useEditorStore();
-
+  const { tool, zoom, gridVisible, selectedColor, setTool, setZoom, toggleGrid, setSelectedColor } = useEditorStore();
   const refresh = () => setRevision((value) => value + 1);
+
+  useEffect(() => {
+    if (!playing || pixelDocument.frameCount < 2) return;
+    const timeout = window.setTimeout(() => { pixelDocument.nextFrame(true); refresh(); }, pixelDocument.activeFrame.durationMs);
+    return () => window.clearTimeout(timeout);
+  }, [playing, pixelDocument, revision]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       if (target?.matches("input, textarea, select")) return;
       const key = event.key.toLowerCase();
-      if ((event.ctrlKey || event.metaKey) && key === "z") {
-        event.preventDefault();
-        const changed = event.shiftKey ? pixelDocument.redo() : pixelDocument.undo();
-        if (changed) refresh();
-        return;
-      }
-      if ((event.ctrlKey || event.metaKey) && key === "y") {
-        event.preventDefault();
-        if (pixelDocument.redo()) refresh();
-        return;
-      }
+      if ((event.ctrlKey || event.metaKey) && key === "z") { event.preventDefault(); const changed = event.shiftKey ? pixelDocument.redo() : pixelDocument.undo(); if (changed) refresh(); return; }
+      if ((event.ctrlKey || event.metaKey) && key === "y") { event.preventDefault(); if (pixelDocument.redo()) refresh(); return; }
+      if (key === " ") { event.preventDefault(); if (pixelDocument.frameCount > 1) setPlaying((value) => !value); return; }
       const match = TOOLS.find((item) => item.key.toLowerCase() === key);
       if (match) setTool(match.id);
     };
@@ -75,222 +65,82 @@ export default function App() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [pixelDocument, setTool]);
 
-  const newCanvas = () => {
-    const safeWidth = Math.max(1, Math.min(512, Math.floor(width || 1)));
-    const safeHeight = Math.max(1, Math.min(512, Math.floor(height || 1)));
-    pixelDocument.resize(safeWidth, safeHeight);
-    setWidth(safeWidth);
-    setHeight(safeHeight);
-    setStatus(`New ${safeWidth}×${safeHeight} canvas`);
-    refresh();
-  };
-
-  const saveProject = () => {
-    const json = JSON.stringify(pixelDocument.toProject(), null, 2);
-    downloadBlob(new Blob([json], { type: "application/json" }), "untitled.efsspde.json");
-    setStatus("Project v2 saved");
-  };
-
-  const loadProject = async (file: File) => {
-    try {
-      const project = JSON.parse(await file.text()) as PixelProjectFile;
-      pixelDocument.loadProject(project);
-      setWidth(pixelDocument.width);
-      setHeight(pixelDocument.height);
-      if (selectedColor >= pixelDocument.palette.length) setSelectedColor(1);
-      setStatus(`Loaded ${file.name} · ${pixelDocument.layerCount} layer(s)`);
-      refresh();
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Could not load project");
-    }
-  };
+  const newCanvas = () => { setPlaying(false); const safeWidth = Math.max(1, Math.min(512, Math.floor(width || 1))); const safeHeight = Math.max(1, Math.min(512, Math.floor(height || 1))); pixelDocument.resize(safeWidth, safeHeight); setWidth(safeWidth); setHeight(safeHeight); setStatus(`New ${safeWidth}×${safeHeight} canvas`); refresh(); };
+  const saveProject = () => { const json = JSON.stringify(pixelDocument.toProject(), null, 2); downloadBlob(new Blob([json], { type: "application/json" }), "untitled.efsspde.json"); setStatus("Project v3 saved"); };
+  const loadProject = async (file: File) => { try { setPlaying(false); const project = JSON.parse(await file.text()) as PixelProjectFile; pixelDocument.loadProject(project); setWidth(pixelDocument.width); setHeight(pixelDocument.height); if (selectedColor >= pixelDocument.palette.length) setSelectedColor(1); setStatus(`Loaded ${file.name} · ${pixelDocument.layerCount} layer(s) · ${pixelDocument.frameCount} frame(s)`); refresh(); } catch (error) { setStatus(error instanceof Error ? error.message : "Could not load project"); } };
 
   const exportPng = () => {
-    const canvas = document.createElement("canvas");
-    canvas.width = pixelDocument.width;
-    canvas.height = pixelDocument.height;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.imageSmoothingEnabled = false;
-    for (let y = 0; y < pixelDocument.height; y++) {
-      for (let x = 0; x < pixelDocument.width; x++) {
-        const index = pixelDocument.getCompositePixel(x, y);
-        if (index === 0) continue;
-        ctx.fillStyle = pixelDocument.palette[index];
-        ctx.fillRect(x, y, 1, 1);
-      }
-    }
-    canvas.toBlob((blob) => {
-      if (blob) downloadBlob(blob, "untitled.png");
-    }, "image/png");
-    setStatus(`Composite PNG exported · ${pixelDocument.width}×${pixelDocument.height}`);
+    const canvas = document.createElement("canvas"); canvas.width = pixelDocument.width; canvas.height = pixelDocument.height;
+    const ctx = canvas.getContext("2d"); if (!ctx) return; ctx.imageSmoothingEnabled = false;
+    for (let y = 0; y < pixelDocument.height; y++) for (let x = 0; x < pixelDocument.width; x++) { const index = pixelDocument.getCompositePixel(x, y); if (index === 0) continue; ctx.fillStyle = pixelDocument.palette[index]; ctx.fillRect(x, y, 1, 1); }
+    canvas.toBlob((blob) => { if (blob) downloadBlob(blob, `frame-${pixelDocument.activeFrameIndex + 1}.png`); }, "image/png");
+    setStatus(`Frame ${pixelDocument.activeFrameIndex + 1} PNG exported`);
   };
 
-  const runCommand = () => {
-    try {
-      const result = executePixelCommandJson(pixelDocument, commandText);
-      setStatus(`${formatCommandResult(result)} · ${pixelDocument.activeLayer.name}`);
-      refresh();
-    } catch (error) {
-      setStatus(error instanceof Error ? `Command error: ${error.message}` : "Command failed");
-    }
-  };
-
-  const addLayer = () => {
-    const layer = pixelDocument.addLayer();
-    setStatus(`Added ${layer.name}`);
-    refresh();
-  };
-
-  const deleteLayer = () => {
-    const name = pixelDocument.activeLayer.name;
-    if (pixelDocument.deleteLayer(pixelDocument.activeLayerId)) {
-      setStatus(`Deleted ${name}`);
-      refresh();
-    }
-  };
-
-  const moveLayer = (direction: "up" | "down") => {
-    if (pixelDocument.moveLayer(pixelDocument.activeLayerId, direction)) {
-      setStatus(`Moved ${pixelDocument.activeLayer.name} ${direction}`);
-      refresh();
-    }
-  };
+  const runCommand = () => { try { const result = executePixelCommandJson(pixelDocument, commandText); setStatus(`${formatCommandResult(result)} · ${pixelDocument.activeLayer.name} · F${pixelDocument.activeFrameIndex + 1}`); refresh(); } catch (error) { setStatus(error instanceof Error ? `Command error: ${error.message}` : "Command failed"); } };
+  const addLayer = () => { const layer = pixelDocument.addLayer(); setStatus(`Added ${layer.name}`); refresh(); };
+  const deleteLayer = () => { const name = pixelDocument.activeLayer.name; if (pixelDocument.deleteLayer(pixelDocument.activeLayerId)) { setStatus(`Deleted ${name}`); refresh(); } };
+  const moveLayer = (direction: "up" | "down") => { if (pixelDocument.moveLayer(pixelDocument.activeLayerId, direction)) { setStatus(`Moved ${pixelDocument.activeLayer.name} ${direction}`); refresh(); } };
+  const addFrame = (duplicate: boolean) => { setPlaying(false); const frame = pixelDocument.addFrame(duplicate); setStatus(`${duplicate ? "Duplicated" : "Added"} ${frame.id}`); refresh(); };
+  const deleteFrame = () => { setPlaying(false); const label = pixelDocument.activeFrame.id; if (pixelDocument.deleteFrame(pixelDocument.activeFrameId)) { setStatus(`Deleted ${label}`); refresh(); } };
 
   return (
     <main className="app-shell">
       <header className="topbar">
-        <div className="brand">
-          <strong>EFSS PDE</strong>
-          <span>Pixel Discipline Editor · M2 Layers</span>
-        </div>
+        <div className="brand"><strong>EFSS PDE</strong><span>Pixel Discipline Editor · M3 Animation</span></div>
         <div className="top-actions">
           <label className="size-field">W <input value={width} type="number" min="1" max="512" onChange={(e) => setWidth(Number(e.target.value))} /></label>
           <label className="size-field">H <input value={height} type="number" min="1" max="512" onChange={(e) => setHeight(Number(e.target.value))} /></label>
-          <button onClick={newCanvas}>New</button>
-          <button onClick={() => fileInputRef.current?.click()}>Open</button>
-          <button onClick={saveProject}>Save JSON</button>
-          <button className="primary" onClick={exportPng}>Export PNG</button>
-          <input
-            ref={fileInputRef}
-            hidden
-            type="file"
-            accept=".json,.efsspde"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) void loadProject(file);
-              e.currentTarget.value = "";
-            }}
-          />
+          <button onClick={newCanvas}>New</button><button onClick={() => fileInputRef.current?.click()}>Open</button><button onClick={saveProject}>Save JSON</button><button className="primary" onClick={exportPng}>Export PNG</button>
+          <input ref={fileInputRef} hidden type="file" accept=".json,.efsspde" onChange={(e) => { const file = e.target.files?.[0]; if (file) void loadProject(file); e.currentTarget.value = ""; }} />
         </div>
       </header>
 
       <section className="workspace">
         <aside className="panel tools-panel">
           <div className="panel-title">TOOLS</div>
-          {TOOLS.map((item) => (
-            <button key={item.id} className={tool === item.id ? "active" : ""} onClick={() => setTool(item.id)}>
-              <span>{item.label}</span><kbd>{item.key}</kbd>
-            </button>
-          ))}
+          {TOOLS.map((item) => <button key={item.id} className={tool === item.id ? "active" : ""} onClick={() => setTool(item.id)}><span>{item.label}</span><kbd>{item.key}</kbd></button>)}
           <div className="separator" />
-          <button disabled={!pixelDocument.canUndo} onClick={() => { if (pixelDocument.undo()) refresh(); }}>Undo <kbd>Ctrl Z</kbd></button>
-          <button disabled={!pixelDocument.canRedo} onClick={() => { if (pixelDocument.redo()) refresh(); }}>Redo <kbd>Ctrl Y</kbd></button>
-          <button onClick={() => { pixelDocument.clear(); setStatus(`Cleared ${pixelDocument.activeLayer.name}`); refresh(); }}>Clear layer</button>
+          <button disabled={!pixelDocument.canUndo || playing} onClick={() => { if (pixelDocument.undo()) refresh(); }}>Undo <kbd>Ctrl Z</kbd></button>
+          <button disabled={!pixelDocument.canRedo || playing} onClick={() => { if (pixelDocument.redo()) refresh(); }}>Redo <kbd>Ctrl Y</kbd></button>
+          <button disabled={playing} onClick={() => { pixelDocument.clear(); setStatus(`Cleared ${pixelDocument.activeLayer.name}`); refresh(); }}>Clear cel</button>
         </aside>
 
-        <section className="canvas-stage">
-          <div className="canvas-scroll">
-            <PixelCanvas
-              document={pixelDocument}
-              revision={revision}
-              onChange={refresh}
-              onPickColor={(index) => { setSelectedColor(index); setStatus(`Picked palette #${index}`); }}
-            />
-          </div>
-        </section>
+        <section className="canvas-stage"><div className="canvas-scroll"><PixelCanvas document={pixelDocument} revision={revision} onionSkin={onionSkin && !playing} readOnly={playing} onChange={refresh} onPickColor={(index) => { setSelectedColor(index); setStatus(`Picked palette #${index}`); }} /></div></section>
 
         <aside className="panel inspector-panel">
           <section>
             <div className="panel-title">PALETTE</div>
-            <div className="palette-grid">
-              {pixelDocument.palette.map((color, index) => (
-                <button
-                  key={`${color}-${index}`}
-                  className={`swatch ${selectedColor === index ? "selected" : ""}`}
-                  style={{ background: index === 0 ? undefined : color }}
-                  title={index === 0 ? "Transparent" : `${index}: ${color}`}
-                  onClick={() => setSelectedColor(index)}
-                >
-                  {index === 0 ? "×" : ""}
-                </button>
-              ))}
-            </div>
-            <div className="color-readout">
-              <span>Index</span><strong>{selectedColor}</strong>
-              <span>Color</span><code>{pixelDocument.palette[selectedColor]}</code>
-            </div>
+            <div className="palette-grid">{pixelDocument.palette.map((color, index) => <button key={`${color}-${index}`} className={`swatch ${selectedColor === index ? "selected" : ""}`} style={{ background: index === 0 ? undefined : color }} title={index === 0 ? "Transparent" : `${index}: ${color}`} onClick={() => setSelectedColor(index)}>{index === 0 ? "×" : ""}</button>)}</div>
+            <div className="color-readout"><span>Index</span><strong>{selectedColor}</strong><span>Color</span><code>{pixelDocument.palette[selectedColor]}</code></div>
           </section>
 
           <section className="layers-panel">
             <div className="panel-title">LAYERS</div>
-            <div className="layer-toolbar">
-              <button onClick={addLayer}>+ Layer</button>
-              <button disabled={pixelDocument.layerCount <= 1} onClick={deleteLayer}>Delete</button>
-              <button onClick={() => moveLayer("up")}>↑</button>
-              <button onClick={() => moveLayer("down")}>↓</button>
-            </div>
-            <div className="layer-list">
-              {[...pixelDocument.layers].reverse().map((layer) => (
-                <div key={layer.id} className={`layer-row ${pixelDocument.activeLayerId === layer.id ? "selected" : ""}`}>
-                  <button
-                    className="visibility-button"
-                    title={layer.visible ? "Hide layer" : "Show layer"}
-                    onClick={() => { pixelDocument.toggleLayerVisibility(layer.id); refresh(); }}
-                  >
-                    {layer.visible ? "●" : "○"}
-                  </button>
-                  <button
-                    className="layer-name"
-                    onClick={() => { pixelDocument.setActiveLayer(layer.id); setStatus(`Active: ${layer.name}`); refresh(); }}
-                  >
-                    {layer.name}
-                  </button>
-                </div>
-              ))}
-            </div>
-            <div className="layer-note">Commands and drawing affect the active layer. Render and PNG export use the visible composite.</div>
+            <div className="layer-toolbar"><button onClick={addLayer}>+ Layer</button><button disabled={pixelDocument.layerCount <= 1} onClick={deleteLayer}>Delete</button><button onClick={() => moveLayer("up")}>↑</button><button onClick={() => moveLayer("down")}>↓</button></div>
+            <div className="layer-list">{[...pixelDocument.layers].reverse().map((layer) => <div key={layer.id} className={`layer-row ${pixelDocument.activeLayerId === layer.id ? "selected" : ""}`}><button className="visibility-button" title={layer.visible ? "Hide layer" : "Show layer"} onClick={() => { pixelDocument.toggleLayerVisibility(layer.id); refresh(); }}>{layer.visible ? "●" : "○"}</button><button className="layer-name" onClick={() => { pixelDocument.setActiveLayer(layer.id); setStatus(`Active: ${layer.name}`); refresh(); }}>{layer.name}</button></div>)}</div>
           </section>
 
           <section className="command-lab">
-            <div className="panel-title">COMMAND ENGINE</div>
-            <p>Deterministic JSON operations run against the active layer as one undoable transaction.</p>
-            <textarea
-              value={commandText}
-              onChange={(event) => setCommandText(event.target.value)}
-              spellCheck={false}
-              aria-label="Pixel command JSON"
-            />
-            <div className="command-actions">
-              <button onClick={() => setCommandText(COMMAND_EXAMPLE)}>Example</button>
-              <button className="primary" onClick={runCommand}>Apply Command</button>
-            </div>
+            <div className="panel-title">COMMAND ENGINE</div><p>Commands affect the active layer and active frame as one undoable transaction.</p>
+            <textarea value={commandText} onChange={(event) => setCommandText(event.target.value)} spellCheck={false} aria-label="Pixel command JSON" disabled={playing} />
+            <div className="command-actions"><button disabled={playing} onClick={() => setCommandText(COMMAND_EXAMPLE)}>Example</button><button disabled={playing} className="primary" onClick={runCommand}>Apply Command</button></div>
             <div className="op-list">set_pixel · clear_pixel · paint_stroke · fill · move_region · replace_color · flip_x · flip_y</div>
           </section>
         </aside>
       </section>
 
-      <footer className="statusbar">
-        <span>{status}</span>
-        <div className="status-actions">
-          <span className="active-layer-status">{pixelDocument.activeLayer.name}</span>
-          <button className={gridVisible ? "active" : ""} onClick={toggleGrid}>Grid</button>
-          {[4, 8, 12, 16, 24, 32].map((value) => (
-            <button key={value} className={zoom === value ? "active" : ""} onClick={() => setZoom(value)}>{value}×</button>
-          ))}
-          <span>{pixelDocument.width}×{pixelDocument.height}px</span>
+      <section className="timeline">
+        <div className="timeline-controls">
+          <button className={playing ? "active" : ""} disabled={pixelDocument.frameCount < 2} onClick={() => setPlaying((value) => !value)}>{playing ? "Pause" : "Play"} <kbd>Space</kbd></button>
+          <button disabled={playing} onClick={() => addFrame(false)}>+ Frame</button><button disabled={playing} onClick={() => addFrame(true)}>Duplicate</button><button disabled={playing || pixelDocument.frameCount <= 1} onClick={deleteFrame}>Delete</button>
+          <button className={onionSkin ? "active" : ""} disabled={playing} onClick={() => setOnionSkin((value) => !value)}>Onion</button>
+          <label className="duration-field">Duration <input type="number" min="20" max="5000" step="10" value={pixelDocument.activeFrame.durationMs} disabled={playing} onChange={(event) => { pixelDocument.setFrameDuration(pixelDocument.activeFrameId, Number(event.target.value)); refresh(); }} /> ms</label>
         </div>
-      </footer>
+        <div className="frame-strip">{pixelDocument.frames.map((frame, index) => <button key={frame.id} className={`frame-chip ${pixelDocument.activeFrameId === frame.id ? "active" : ""}`} onClick={() => { setPlaying(false); pixelDocument.setActiveFrame(frame.id); setStatus(`Frame ${index + 1}`); refresh(); }}><strong>F{index + 1}</strong><span>{frame.durationMs}ms</span></button>)}</div>
+      </section>
+
+      <footer className="statusbar"><span>{status}</span><div className="status-actions"><span className="active-layer-status">F{pixelDocument.activeFrameIndex + 1} · {pixelDocument.activeLayer.name}</span><button className={gridVisible ? "active" : ""} onClick={toggleGrid}>Grid</button>{[4, 8, 12, 16, 24, 32].map((value) => <button key={value} className={zoom === value ? "active" : ""} onClick={() => setZoom(value)}>{value}×</button>)}<span>{pixelDocument.width}×{pixelDocument.height}px</span></div></footer>
     </main>
   );
 }
