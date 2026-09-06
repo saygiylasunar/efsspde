@@ -8,7 +8,7 @@
 * { box-sizing: border-box; }
 html, body, #root { margin: 0; min-width: 900px; min-height: 100%; }
 body { overflow: hidden; }
-button, input { font: inherit; }
+button, input, textarea { font: inherit; }
 button { color: inherit; }
 
 .app-shell {
@@ -62,11 +62,11 @@ button.primary { border-color: #8b5cf6; background: #6d28d9; }
 .workspace {
   min-height: 0;
   display: grid;
-  grid-template-columns: 164px minmax(0, 1fr) 210px;
+  grid-template-columns: 164px minmax(0, 1fr) 300px;
 }
 .panel { background: #1b1c21; padding: 10px; min-height: 0; }
 .tools-panel { border-right: 1px solid #303138; }
-.palette-panel { border-left: 1px solid #303138; }
+.inspector-panel { border-left: 1px solid #303138; overflow: auto; }
 .panel-title { margin: 2px 0 10px; font-size: 11px; font-weight: 700; letter-spacing: .12em; color: #8b8b94; }
 .tools-panel > button { display: flex; justify-content: space-between; width: 100%; margin-bottom: 5px; }
 kbd { color: #8b8b94; font-size: 10px; font-family: inherit; }
@@ -88,7 +88,7 @@ kbd { color: #8b8b94; font-size: 10px; font-family: inherit; }
   cursor: crosshair;
 }
 
-.palette-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; }
+.palette-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px; }
 .swatch {
   position: relative;
   aspect-ratio: 1;
@@ -100,12 +100,34 @@ kbd { color: #8b8b94; font-size: 10px; font-family: inherit; }
   background-position: 0 0,0 5px,5px -5px,-5px 0;
 }
 .swatch.selected { outline: 2px solid #a78bfa; outline-offset: 2px; }
-.color-readout { display: grid; grid-template-columns: auto 1fr; gap: 7px 10px; margin-top: 16px; font-size: 12px; align-items: center; }
+.color-readout { display: grid; grid-template-columns: auto 1fr; gap: 7px 10px; margin-top: 14px; font-size: 12px; align-items: center; }
 .color-readout span { color: #8b8b94; }
 .color-readout code { font-size: 11px; overflow-wrap: anywhere; }
 
+.command-lab { margin-top: 22px; padding-top: 18px; border-top: 1px solid #303138; }
+.command-lab p { margin: -2px 0 9px; color: #8b8b94; font-size: 11px; line-height: 1.45; }
+.command-lab textarea {
+  display: block;
+  width: 100%;
+  height: 210px;
+  resize: vertical;
+  border: 1px solid #3a3b43;
+  border-radius: 5px;
+  background: #101115;
+  color: #d4d4d8;
+  padding: 9px;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  tab-size: 2;
+}
+.command-lab textarea:focus { outline: 2px solid #6d28d9; outline-offset: 1px; }
+.command-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 7px; }
+.op-list { margin-top: 9px; font-size: 10px; line-height: 1.5; color: #71717a; overflow-wrap: anywhere; }
+
 .status-actions button { min-height: 24px; padding: 2px 7px; font-size: 11px; }
 
-@media (max-width: 1000px) {
+@media (max-width: 1080px) {
   .brand span { display: none; }
+  .workspace { grid-template-columns: 150px minmax(0, 1fr) 270px; }
 }
