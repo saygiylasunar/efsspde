@@ -11,7 +11,8 @@
     "bridge:check": "tsc -p bridge/tsconfig.json --noEmit",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "bridge:smoke": "tsx bridge/smoke.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "^2.0.0",
@@ -21,7 +22,8 @@
     "react-dom": "^19.1.1",
     "ws": "^8.18.3",
     "zod": "^4.2.0",
-    "zustand": "^5.0.8"
+    "zustand": "^5.0.8",
+    "@modelcontextprotocol/client": "^2.0.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.8.4",
