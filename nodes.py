@@ -200,6 +200,65 @@ def _resample_logical(
     raise ValueError(f"Unsupported logical sampling mode: {mode}")
 
 
+
+def _adaptive_resample(
+    image: torch.Tensor,
+    target_width: int,
+    target_height: int,
+    profile: str,
+) -> torch.Tensor:
+    _validate_image(image)
+
+    area = _resample_logical(image, target_width, target_height, "area")
+    nearest = _resample_logical(image, target_width, target_height, "nearest")
+
+    _, source_height, source_width, _ = image.shape
+    exact_cells = source_width % target_width == 0 and source_height % target_height == 0
+    medoid = (
+        _resample_logical(image, target_width, target_height, "medoid")
+        if exact_cells
+        else nearest
+    )
+
+    # Per-cell color variance: high values mean texture / mixed colors inside the cell.
+    bchw = image.permute(0, 3, 1, 2)
+    mean = F.interpolate(bchw, size=(target_height, target_width), mode="area")
+    mean_sq = F.interpolate(bchw * bchw, size=(target_height, target_width), mode="area")
+    variance = (mean_sq - mean * mean).clamp_min(0.0).mean(dim=1)
+
+    # Logical edge strength from luma changes between neighboring target cells.
+    luma = (
+        area[..., 0] * 0.299
+        + area[..., 1] * 0.587
+        + area[..., 2] * 0.114
+    )
+    dx = torch.zeros_like(luma)
+    dy = torch.zeros_like(luma)
+    dx[:, :, 1:] = torch.abs(luma[:, :, 1:] - luma[:, :, :-1])
+    dy[:, 1:, :] = torch.abs(luma[:, 1:, :] - luma[:, :-1, :])
+    edge = torch.maximum(dx, dy)
+
+    profiles = {
+        "balanced": (0.045, 0.012, 0.095),
+        "outline": (0.025, 0.008, 0.060),
+        "sprite": (0.030, 0.009, 0.070),
+        "soft": (0.075, 0.020, 0.140),
+        "background": (0.090, 0.025, 0.170),
+    }
+    edge_threshold, variance_threshold, hard_edge_threshold = profiles.get(
+        profile, profiles["balanced"]
+    )
+
+    # Area owns smooth regions. Medoid owns mixed/structured cells. Nearest is
+    # reserved for the strongest hard transitions where contour placement matters most.
+    use_medoid = (edge >= edge_threshold) | (variance >= variance_threshold)
+    use_nearest = edge >= hard_edge_threshold
+
+    result = torch.where(use_medoid.unsqueeze(-1), medoid, area)
+    result = torch.where(use_nearest.unsqueeze(-1), nearest, result)
+    return result.contiguous().clamp(0.0, 1.0)
+
+
 def _nearest_palette_indices(
     image: torch.Tensor,
     palette: PaletteSpec,
@@ -367,7 +426,8 @@ class EFSSPixelMap:
                 "image": ("IMAGE",),
                 "target_width": ("INT", {"default": 32, "min": 1, "max": 2048, "step": 1}),
                 "target_height": ("INT", {"default": 32, "min": 1, "max": 2048, "step": 1}),
-                "sampling": (["medoid", "area", "nearest"], {"default": "medoid"}),
+                "sampling": (["adaptive", "medoid", "area", "nearest"], {"default": "adaptive"}),
+                "profile": (["balanced", "outline", "sprite", "soft", "background"], {"default": "balanced"}),
             }
         }
 
@@ -382,13 +442,22 @@ class EFSSPixelMap:
         target_width: int,
         target_height: int,
         sampling: str,
+        profile: str,
     ):
-        sampled = _resample_logical(
-            image,
-            target_width=target_width,
-            target_height=target_height,
-            mode=sampling,
-        )
+        if sampling == "adaptive":
+            sampled = _adaptive_resample(
+                image,
+                target_width=target_width,
+                target_height=target_height,
+                profile=profile,
+            )
+        else:
+            sampled = _resample_logical(
+                image,
+                target_width=target_width,
+                target_height=target_height,
+                mode=sampling,
+            )
         return (sampled.to(dtype=image.dtype),)
 
 
