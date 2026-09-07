@@ -259,6 +259,222 @@ def _adaptive_resample(
     return result.contiguous().clamp(0.0, 1.0)
 
 
+def _logical_blocks(
+    image: torch.Tensor,
+    target_width: int,
+    target_height: int,
+) -> torch.Tensor | None:
+    _validate_image(image)
+    _, source_height, source_width, _ = image.shape
+    if source_width % target_width != 0 or source_height % target_height != 0:
+        return None
+
+    cell_width = source_width // target_width
+    cell_height = source_height // target_height
+    return (
+        image.reshape(
+            image.shape[0],
+            target_height,
+            cell_height,
+            target_width,
+            cell_width,
+            3,
+        )
+        .permute(0, 1, 3, 2, 4, 5)
+        .reshape(
+            image.shape[0],
+            target_height,
+            target_width,
+            cell_height * cell_width,
+            3,
+        )
+    )
+
+
+def _phase_candidate(
+    blocks: torch.Tensor,
+    cell_width: int,
+    cell_height: int,
+    phase_samples: int,
+) -> torch.Tensor:
+    if phase_samples <= 1:
+        ys = [0.5]
+        xs = [0.5]
+    elif phase_samples <= 4:
+        ys = [0.25, 0.75]
+        xs = [0.25, 0.75]
+    else:
+        ys = [1.0 / 6.0, 0.5, 5.0 / 6.0]
+        xs = [1.0 / 6.0, 0.5, 5.0 / 6.0]
+
+    indices: list[int] = []
+    for fy in ys:
+        y = min(cell_height - 1, max(0, int(round(fy * cell_height - 0.5))))
+        for fx in xs:
+            x = min(cell_width - 1, max(0, int(round(fx * cell_width - 0.5))))
+            index = y * cell_width + x
+            if index not in indices:
+                indices.append(index)
+
+    phase = blocks[..., indices, :]
+    mean = blocks.mean(dim=3, keepdim=True)
+    distance = ((phase - mean) ** 2).sum(dim=-1)
+    choice = distance.argmin(dim=3, keepdim=True)
+    gather_index = choice.unsqueeze(-1).expand(-1, -1, -1, 1, 3)
+    return torch.gather(phase, dim=3, index=gather_index).squeeze(3)
+
+
+def _candidate_stack(
+    image: torch.Tensor,
+    target_width: int,
+    target_height: int,
+    phase_samples: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    area = _resample_logical(image, target_width, target_height, "area")
+    nearest = _resample_logical(image, target_width, target_height, "nearest")
+    blocks = _logical_blocks(image, target_width, target_height)
+
+    if blocks is None:
+        candidates = torch.stack(
+            [area, nearest, nearest, area, nearest, nearest],
+            dim=0,
+        )
+    else:
+        mean = blocks.mean(dim=3, keepdim=True)
+        distance = ((blocks - mean) ** 2).sum(dim=-1)
+        choice = distance.argmin(dim=3, keepdim=True)
+        gather_index = choice.unsqueeze(-1).expand(-1, -1, -1, 1, 3)
+        medoid = torch.gather(blocks, dim=3, index=gather_index).squeeze(3)
+
+        median = blocks.median(dim=3).values
+
+        # Dominant-cluster candidate: mode of a coarse 5-bit RGB code, then use
+        # a real source pixel from that winning bin rather than the bin center.
+        quantized = (blocks.clamp(0.0, 1.0) * 31.0).round().to(dtype=torch.int64)
+        codes = quantized[..., 0] * 1024 + quantized[..., 1] * 32 + quantized[..., 2]
+        mode_result = torch.mode(codes, dim=3)
+        mode_index = mode_result.indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, 1, 3)
+        dominant = torch.gather(blocks, dim=3, index=mode_index).squeeze(3)
+
+        _, source_height, source_width, _ = image.shape
+        cell_width = source_width // target_width
+        cell_height = source_height // target_height
+        phase = _phase_candidate(blocks, cell_width, cell_height, phase_samples)
+
+        candidates = torch.stack(
+            [area, nearest, medoid, median, dominant, phase],
+            dim=0,
+        )
+
+    bchw = image.permute(0, 3, 1, 2)
+    mean = F.interpolate(bchw, size=(target_height, target_width), mode="area")
+    mean_sq = F.interpolate(bchw * bchw, size=(target_height, target_width), mode="area")
+    variance = (mean_sq - mean * mean).clamp_min(0.0).mean(dim=1)
+
+    luma = area[..., 0] * 0.299 + area[..., 1] * 0.587 + area[..., 2] * 0.114
+    dx = torch.zeros_like(luma)
+    dy = torch.zeros_like(luma)
+    dx[:, :, 1:] = torch.abs(luma[:, :, 1:] - luma[:, :, :-1])
+    dy[:, 1:, :] = torch.abs(luma[:, 1:, :] - luma[:, :-1, :])
+    edge = torch.maximum(dx, dy)
+    return candidates, edge, variance
+
+
+def _context_average(value: torch.Tensor, radius: int) -> torch.Tensor:
+    if radius <= 0:
+        return value
+    kernel = radius * 2 + 1
+    return F.avg_pool2d(
+        value.unsqueeze(1),
+        kernel_size=kernel,
+        stride=1,
+        padding=radius,
+    ).squeeze(1)
+
+
+def _disciplined_downscale(
+    image: torch.Tensor,
+    target_width: int,
+    target_height: int,
+    profile: str,
+    adaptive_strength: float,
+    contour_priority: float,
+    soft_depth: float,
+    source_fidelity: float,
+    edge_threshold: float,
+    variance_threshold: float,
+    context_radius: int,
+    phase_samples: int,
+    contour_lock: float,
+    noise_rejection: float,
+) -> torch.Tensor:
+    candidates, edge, variance = _candidate_stack(
+        image,
+        target_width=target_width,
+        target_height=target_height,
+        phase_samples=phase_samples,
+    )
+
+    edge_context = _context_average(edge, context_radius)
+    variance_context = _context_average(variance, context_radius)
+
+    edge_scale = max(float(edge_threshold), 1e-6)
+    variance_scale = max(float(variance_threshold), 1e-6)
+    edge_n = (edge_context / edge_scale).clamp(0.0, 2.0) * 0.5
+    variance_n = (variance_context / variance_scale).clamp(0.0, 2.0) * 0.5
+    smooth_n = (1.0 - torch.maximum(edge_n, variance_n)).clamp(0.0, 1.0)
+
+    # Method order:
+    # 0 area, 1 nearest, 2 medoid, 3 median, 4 dominant cluster, 5 phase sample.
+    scores = torch.zeros(
+        (6, image.shape[0], target_height, target_width),
+        device=image.device,
+        dtype=image.dtype,
+    )
+
+    adaptive = float(adaptive_strength)
+    contour = float(contour_priority)
+    soft = float(soft_depth)
+    fidelity = float(source_fidelity)
+    lock = float(contour_lock)
+    noise = float(noise_rejection)
+
+    scores[0] = (1.35 * soft * smooth_n) + (1.0 - adaptive) * 1.25
+    scores[1] = adaptive * contour * edge_n * (1.0 + 0.8 * lock)
+    scores[2] = adaptive * fidelity * (0.35 + 0.65 * torch.maximum(edge_n, variance_n))
+    scores[3] = adaptive * noise * variance_n * (0.35 + 0.65 * (1.0 - edge_n))
+    scores[4] = adaptive * (0.45 + 0.55 * noise) * variance_n * (0.55 + 0.45 * smooth_n)
+    scores[5] = adaptive * fidelity * (0.25 + 0.75 * edge_n) * (0.55 + 0.45 * contour)
+
+    profile_bias = {
+        "balanced": (1.00, 1.00, 1.00, 1.00, 1.00, 1.00),
+        "crisp": (0.70, 1.35, 1.20, 0.70, 0.90, 1.15),
+        "soft": (1.40, 0.55, 0.85, 1.10, 1.00, 0.75),
+        "sprite": (0.55, 1.35, 1.25, 0.65, 1.25, 1.20),
+        "portrait": (1.20, 0.75, 1.05, 1.10, 0.95, 0.90),
+    }.get(profile, (1.00, 1.00, 1.00, 1.00, 1.00, 1.00))
+
+    for index, bias in enumerate(profile_bias):
+        scores[index] *= bias
+
+    hard_edge = edge_n >= 0.5
+    scores[0] = torch.where(
+        hard_edge,
+        scores[0] * (1.0 - 0.75 * lock),
+        scores[0],
+    )
+    scores[3] = torch.where(
+        hard_edge,
+        scores[3] * (1.0 - 0.60 * lock),
+        scores[3],
+    )
+
+    choice = scores.argmax(dim=0)
+    gather_index = choice.unsqueeze(0).unsqueeze(-1).expand(1, -1, -1, -1, 3)
+    result = torch.gather(candidates, dim=0, index=gather_index).squeeze(0)
+    return result.contiguous().clamp(0.0, 1.0)
+
+
 def _nearest_palette_indices(
     image: torch.Tensor,
     palette: PaletteSpec,
@@ -418,6 +634,99 @@ class EFSSPixelCanvas:
         return (generation_width, generation_height, target_width, target_height, cell_scale)
 
 
+class EFSSDisciplinedDownscale:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "target_width": ("INT", {"default": 72, "min": 1, "max": 2048, "step": 1}),
+                "target_height": ("INT", {"default": 90, "min": 1, "max": 2048, "step": 1}),
+                "profile": (
+                    ["balanced", "crisp", "soft", "sprite", "portrait"],
+                    {"default": "balanced"},
+                ),
+                "adaptive_strength": (
+                    "FLOAT",
+                    {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "contour_priority": (
+                    "FLOAT",
+                    {"default": 0.70, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "soft_depth": (
+                    "FLOAT",
+                    {"default": 0.45, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "source_fidelity": (
+                    "FLOAT",
+                    {"default": 0.65, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "edge_threshold": (
+                    "FLOAT",
+                    {"default": 0.045, "min": 0.001, "max": 0.25, "step": 0.001},
+                ),
+                "variance_threshold": (
+                    "FLOAT",
+                    {"default": 0.012, "min": 0.001, "max": 0.10, "step": 0.001},
+                ),
+                "context_radius": (
+                    "INT",
+                    {"default": 1, "min": 0, "max": 4, "step": 1},
+                ),
+                "phase_samples": (["1", "4", "9"], {"default": "4"}),
+                "contour_lock": (
+                    "FLOAT",
+                    {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "noise_rejection": (
+                    "FLOAT",
+                    {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "downscale"
+    CATEGORY = "EFSS PDE"
+
+    def downscale(
+        self,
+        image: torch.Tensor,
+        target_width: int,
+        target_height: int,
+        profile: str,
+        adaptive_strength: float,
+        contour_priority: float,
+        soft_depth: float,
+        source_fidelity: float,
+        edge_threshold: float,
+        variance_threshold: float,
+        context_radius: int,
+        phase_samples: str,
+        contour_lock: float,
+        noise_rejection: float,
+    ):
+        output = _disciplined_downscale(
+            image,
+            target_width=target_width,
+            target_height=target_height,
+            profile=profile,
+            adaptive_strength=adaptive_strength,
+            contour_priority=contour_priority,
+            soft_depth=soft_depth,
+            source_fidelity=source_fidelity,
+            edge_threshold=edge_threshold,
+            variance_threshold=variance_threshold,
+            context_radius=context_radius,
+            phase_samples=int(phase_samples),
+            contour_lock=contour_lock,
+            noise_rejection=noise_rejection,
+        )
+        return (output.to(dtype=image.dtype),)
+
+
 class EFSSPixelMap:
     @classmethod
     def INPUT_TYPES(cls):
@@ -434,7 +743,7 @@ class EFSSPixelMap:
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("pixel_image",)
     FUNCTION = "map_pixels"
-    CATEGORY = "EFSS PDE/Pixel"
+    CATEGORY = "EFSS PDE/Advanced"
 
     def map_pixels(
         self,
@@ -476,7 +785,7 @@ class EFSSPixelGuide:
     RETURN_TYPES = ("IMAGE", "INT")
     RETURN_NAMES = ("guided_image", "changed_pixels")
     FUNCTION = "guide"
-    CATEGORY = "EFSS PDE/Pixel"
+    CATEGORY = "EFSS PDE/Advanced"
 
     def guide(
         self,
@@ -601,6 +910,7 @@ class EFSSPaletteQuantize:
 
 NODE_CLASS_MAPPINGS = {
     "EFSSPDE_PixelCanvas": EFSSPixelCanvas,
+    "EFSSPDE_DisciplinedDownscale": EFSSDisciplinedDownscale,
     "EFSSPDE_PixelMap": EFSSPixelMap,
     "EFSSPDE_PixelGuide": EFSSPixelGuide,
     "EFSSPDE_PixelPreview": EFSSPixelPreview,
@@ -611,6 +921,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "EFSSPDE_PixelCanvas": "EFSS Pixel Canvas",
+    "EFSSPDE_DisciplinedDownscale": "EFSS Disciplined Downscale",
     "EFSSPDE_PixelMap": "EFSS Pixel Map",
     "EFSSPDE_PixelGuide": "EFSS Pixel Guide",
     "EFSSPDE_PixelPreview": "EFSS Pixel Preview",
