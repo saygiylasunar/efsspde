@@ -110,6 +110,16 @@ The learned path may use tiled inference similar to tiled upscale workflows, but
 
 See [LEARNED_DOWNSCALE.md](LEARNED_DOWNSCALE.md).
 
+## Legacy workflow compatibility
+
+Workflows saved before the palette/indexed refactor may still contain stale
+`palette` inputs and `EFSS_INDEXED` links on **EFSS Pixel Map / Pixel Guide**.
+
+The compatibility layer accepts and ignores those obsolete inputs so old
+workflows do not crash after updating the node package. New workflows should
+prefer **EFSS Disciplined Downscale** and should not depend on legacy indexed
+wiring.
+
 ## Installation
 
 Clone the repository into ComfyUI custom nodes:
