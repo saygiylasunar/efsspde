@@ -6,6 +6,22 @@ Instead of treating downscale as a single resize filter, EFSS PDE evaluates mult
 
 > Current development focus: **EFSS Disciplined Downscale**
 
+## Golden baseline
+
+The last known-good direct-method baseline is pinned at:
+
+```text
+golden/medoid-baseline-c4609aac
+```
+
+Commit:
+
+```text
+c4609aac010e6277f0e000ef034c41dfd56b48b3
+```
+
+This snapshot preserves the simple `nearest / area / medoid` behavior before adaptive and single-node resolver experiments. See [GOLDEN_BASELINE.md](GOLDEN_BASELINE.md) for the regression contract and comparison checklist.
+
 ## Quick workflow
 
 ```text
