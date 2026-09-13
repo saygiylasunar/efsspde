@@ -507,6 +507,16 @@ def _nearest_palette_indices(
     return torch.cat(result, dim=0).reshape(image.shape[0], image.shape[1], image.shape[2])
 
 
+def _legacy_indexed_payload(image: torch.Tensor) -> dict[str, object]:
+    """Compatibility payload for workflows created before palette/indexed removal."""
+    return {
+        "version": 2,
+        "image": image,
+        "width": int(image.shape[2]),
+        "height": int(image.shape[1]),
+    }
+
+
 def _render_palette_indices(
     indices: torch.Tensor,
     palette: PaletteSpec,
@@ -740,8 +750,10 @@ class EFSSPixelMap:
             }
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("pixel_image",)
+    # Slot 1 is retained only so workflows saved before the palette/indexed
+    # refactor can still execute. New workflows should use pixel_image only.
+    RETURN_TYPES = ("IMAGE", "EFSS_INDEXED")
+    RETURN_NAMES = ("pixel_image", "legacy_indexed")
     FUNCTION = "map_pixels"
     CATEGORY = "EFSS PDE/Advanced"
 
@@ -752,7 +764,10 @@ class EFSSPixelMap:
         target_height: int,
         sampling: str,
         profile: str,
+        palette=None,
+        **legacy_inputs,
     ):
+        # palette and any other legacy inputs are intentionally ignored.
         if sampling == "adaptive":
             sampled = _adaptive_resample(
                 image,
@@ -767,7 +782,8 @@ class EFSSPixelMap:
                 target_height=target_height,
                 mode=sampling,
             )
-        return (sampled.to(dtype=image.dtype),)
+        sampled = sampled.to(dtype=image.dtype)
+        return (sampled, _legacy_indexed_payload(sampled))
 
 
 class EFSSPixelGuide:
@@ -793,7 +809,11 @@ class EFSSPixelGuide:
         passes: int,
         min_similar_neighbors: int,
         similarity_threshold: float,
+        indexed=None,
+        **legacy_inputs,
     ):
+        # indexed existed before the RGB-native guide refactor; stale workflows
+        # may still submit it, but the current guide intentionally ignores it.
         guided, changed = _guide_rgb(
             image,
             passes=passes,
