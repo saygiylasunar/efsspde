@@ -1,28 +1,33 @@
 # EFSS PDE Nodes
 
-**EFSS PDE** is a standalone ComfyUI custom-node package for disciplined pixel reduction.
+**EFSS PDE** is a standalone ComfyUI custom-node package for deterministic, structure-aware pixel reduction.
 
-Instead of treating downscale as a single resize filter, EFSS PDE evaluates multiple reduction methods per logical target cell and resolves them according to local structure such as contour strength, variance, softness and source fidelity.
+The project treats downscaling as **information reduction**, not as a single resize filter. Its engine keeps direct reduction methods independently testable, then lets an optional resolver choose among those real methods per logical target cell.
 
-> Current development focus: **EFSS Disciplined Downscale**
+## Design contract
 
-## Golden baseline
+The core is deliberately layered:
 
-The last known-good direct-method baseline is pinned at:
+```text
+stable primitive methods
+        ↓
+optional adaptive / disciplined selector
+        ↓
+native-grid IMAGE
+```
+
+A named primitive must execute that primitive. The resolver may choose among primitives, but it must not silently redefine or substitute them.
+
+The historical regression reference remains pinned at:
 
 ```text
 golden/medoid-baseline-c4609aac
-```
-
-Commit:
-
-```text
 c4609aac010e6277f0e000ef034c41dfd56b48b3
 ```
 
-This snapshot preserves the simple `nearest / area / medoid` behavior before adaptive and single-node resolver experiments. See [GOLDEN_BASELINE.md](GOLDEN_BASELINE.md) for the regression contract and comparison checklist.
+See [GOLDEN_BASELINE.md](GOLDEN_BASELINE.md) for the original contract.
 
-## Quick workflow
+## Recommended workflow
 
 ```text
 VAE Decode / IMAGE
@@ -31,25 +36,58 @@ EFSS Disciplined Downscale
         ↓
 native-grid IMAGE
         ↓
+[optional Palette Quantize]
+        ↓
 Preview / Save
 ```
 
-The recommended node has only one image socket in and one image socket out. Target dimensions and behavior are controlled with node widgets, so the workflow stays compact.
+For method comparison, regression work, or strict manual control use **EFSS Primitive Downscale** instead.
+
+## EFSS Primitive Downscale
+
+This node exposes every deterministic reduction method directly:
+
+- **area** — logical-cell mean; stable for soft shading, but may invent averaged colors.
+- **nearest** — crisp nearest source sample.
+- **medoid** — real source pixel closest to the logical-cell mean.
+- **median** — per-channel median for local noise resistance.
+- **dominant** — real source pixel from the dominant coarse RGB cluster.
+- **phase** — real source sample selected from 1 / 4 / 9 internal phase positions.
+
+### Arbitrary-ratio logical cells
+
+Primitive methods now support non-integer reductions such as:
+
+```text
+768x1024 -> 108x144
+```
+
+The source image is partitioned into deterministic, non-overlapping logical cells using integer boundaries. Source-sensitive methods operate on the actual pixels owned by each cell.
+
+There is no silent `medoid -> nearest` fallback.
+
+Upscaling is rejected: EFSS PDE is a reduction engine.
 
 ## EFSS Disciplined Downscale
 
-The node currently evaluates a candidate pool including:
+The disciplined node evaluates the same real primitive pool per logical target cell:
 
-- **Area** — stable for soft shading, blur and depth; may introduce averaged colors.
-- **Nearest** — crisp and useful for hard transitions and contours.
-- **Medoid** — selects a real source pixel closest to the logical cell mean.
-- **Median** — robust against local noise.
-- **Dominant Cluster** — detects a coarse RGB majority group and returns a real source pixel.
-- **Phase Sampling** — evaluates 1 / 4 / 9 offset samples to reduce grid-alignment loss.
+```text
+area
+nearest
+medoid
+median
+dominant
+phase
+   ↓
+edge + variance + local context
+   ↓
+profile-weighted resolver
+   ↓
+native-grid IMAGE
+```
 
-The resolver decides which candidate should own each output pixel instead of forcing one resize method over the entire image.
-
-### Controls
+Controls:
 
 - `target_width`
 - `target_height`
@@ -65,90 +103,108 @@ The resolver decides which candidate should own each output pixel instead of for
 - `contour_lock`
 - `noise_rejection`
 
-## Design principle
+The resolver is a selector over explicit primitives; it is not a replacement implementation for them.
 
-EFSS PDE treats downscale as **information reduction**, not merely image resizing.
+## Palette tools
 
-```text
-large IMAGE
-   ↓
-logical target cells
-   ↓
-candidate methods
-   ↓
-local analysis
-   ↓
-per-cell resolver
-   ↓
-native pixel IMAGE
-```
+Palette remains optional and structurally separate from geometry/reduction.
 
-A hard contour and a soft depth region can therefore use different reduction behavior inside the same result.
+Available nodes:
 
-## Optional palette layer
-
-Palette is intentionally **not** a structural dependency of the main pipeline.
-
-Optional advanced nodes:
-
-- **EFSS Palette**
-- **EFSS Auto Palette**
-- **EFSS Palette Quantize**
-
-Use them only when fixed or reduced palette control is actually part of the art direction.
+- **EFSS Palette** — build an explicit 2–256 color palette from HEX.
+- **EFSS Auto Palette** — deterministic K-Means palette extraction.
+- **EFSS Palette Quantize** — map an image to an EFSS palette.
+- **EFSS Palette Inspector** — report exact 8-bit unique colors and pixel usage.
+- **EFSS Palette Preview** — render palette swatches inside ComfyUI.
+- **EFSS Palette Consolidate** — merge nearby palette colors while choosing a real existing palette color as the group medoid.
 
 ```text
-EFSS Disciplined Downscale
-        ↓
-[optional Palette Quantize]
-        ↓
-IMAGE
+Disciplined / Primitive Downscale
+              ↓
+      [optional palette tools]
+              ↓
+            IMAGE
 ```
 
-## Advanced / low-level nodes
+## Supporting nodes
 
-The lower-level building blocks remain available for explicit experiments:
+- **EFSS Pixel Canvas** — calculate integer-aligned generation dimensions.
+- **EFSS Pixel Guide** — conservative RGB-neighborhood cleanup.
+- **EFSS Pixel Preview** — integer nearest-neighbor preview scaling.
+- **EFSS Pixel Map (Compatibility)** — advanced/legacy mapping surface retained for older workflows.
 
-- **EFSS Pixel Map**
-- **EFSS Pixel Guide**
-- **EFSS Pixel Canvas**
-- **EFSS Pixel Preview**
+## Legacy workflow compatibility
 
-They are not required for the recommended one-node path.
+Older workflows may still contain stale:
+
+- `palette` input on Pixel Map
+- `EFSS_INDEXED` output links from Pixel Map
+- `indexed` input on Pixel Guide
+
+The compatibility surface accepts these obsolete values so saved workflows do not fail immediately after upgrading.
+
+New workflows should use **EFSS Primitive Downscale** or **EFSS Disciplined Downscale** and should not build new dependencies on legacy indexed wiring.
+
+## Determinism and source fidelity
+
+The package deliberately avoids random palette initialization and hidden method fallback.
+
+Regression tests cover:
+
+- exact-ratio medoid determinism
+- non-integer reduction for all primitives
+- source-pixel fidelity for nearest / medoid / dominant / phase
+- fail-closed upscale behavior
+- disciplined-resolver determinism
+- deterministic auto-palette extraction
+- palette inspection / preview / consolidation
+- legacy node-call compatibility
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the engine contract.
 
 ## Learned downscale sibling
 
-A future learned model is planned as a **separate sibling node**, not as a hidden AI switch inside the deterministic resolver.
-
-Possible implementation formats may include `.pth`, `.safetensors`, TorchScript or another suitable runtime format.
-
-The learned path may use tiled inference similar to tiled upscale workflows, but in the opposite direction: each tile contributes to a disciplined native-grid reduction.
+A future learned implementation remains a separate sibling concept rather than a hidden AI switch in the deterministic node.
 
 See [LEARNED_DOWNSCALE.md](LEARNED_DOWNSCALE.md).
 
 ## Installation
 
-Clone the repository into ComfyUI custom nodes:
+### ComfyUI Manager / Registry
 
-```text
-ComfyUI/custom_nodes/efsspde
+Package metadata is defined in `pyproject.toml` under the **saygiylasunar** publisher.
+
+### Manual
+
+Clone into your ComfyUI custom nodes directory:
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/saygiylasunar/efsspde.git
 ```
 
-Then restart ComfyUI.
+Restart ComfyUI after installation or update.
 
-No `npm install` is required. The current custom-node package is Python-based and uses PyTorch provided by ComfyUI.
-
-To update an existing clone:
+To update:
 
 ```bash
 git pull
 ```
 
-Then restart ComfyUI.
+No `npm install` is required. Runtime PyTorch is supplied by ComfyUI.
 
-## Scope
+## Development
 
-This package owns the Comfy-side pixel reduction boundary:
+CI compiles the package and runs the PyTorch regression suite.
+
+Local test example:
+
+```bash
+python -m pip install pytest
+pytest -q tests
+```
+
+The repository's standalone Comfy node boundary is:
 
 ```text
 VAE Decode / IMAGE
