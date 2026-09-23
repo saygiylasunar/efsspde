@@ -67,3 +67,8 @@ def test_inspector_node_returns_usage_report():
     assert count == 1
     assert colors == "#000000"
     assert "4 px" in report
+
+
+def test_portable_installer_copies_core_module():
+    install_script = Path(__file__).resolve().parents[1] / "install.ps1"
+    assert '"core.py"' in install_script.read_text(encoding="utf-8")
