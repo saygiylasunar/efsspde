@@ -40,6 +40,64 @@ def test_exact_medoid_is_deterministic_and_source_faithful():
     assert all(tuple(row.tolist()) in source for row in a.reshape(-1, 3))
 
 
+
+def test_exact_ratio_matches_golden_area_nearest_medoid_semantics():
+    torch.manual_seed(23)
+    image = torch.rand((1, 8, 12, 3), dtype=torch.float32)
+    target_width, target_height = 4, 2
+
+    bchw = image.permute(0, 3, 1, 2)
+    golden_area = torch.nn.functional.interpolate(
+        bchw, size=(target_height, target_width), mode="area"
+    ).permute(0, 2, 3, 1).contiguous()
+    golden_nearest = torch.nn.functional.interpolate(
+        bchw, size=(target_height, target_width), mode="nearest"
+    ).permute(0, 2, 3, 1).contiguous()
+
+    cell_width = image.shape[2] // target_width
+    cell_height = image.shape[1] // target_height
+    blocks = (
+        image.reshape(
+            image.shape[0],
+            target_height,
+            cell_height,
+            target_width,
+            cell_width,
+            3,
+        )
+        .permute(0, 1, 3, 2, 4, 5)
+        .reshape(
+            image.shape[0],
+            target_height,
+            target_width,
+            cell_height * cell_width,
+            3,
+        )
+    )
+    mean = blocks.mean(dim=3, keepdim=True)
+    distance = ((blocks - mean) ** 2).sum(dim=-1)
+    choice = distance.argmin(dim=3, keepdim=True)
+    golden_medoid = torch.gather(
+        blocks,
+        dim=3,
+        index=choice.unsqueeze(-1).expand(-1, -1, -1, 1, 3),
+    ).squeeze(3)
+
+    assert torch.allclose(
+        reduce_primitive(image, target_width, target_height, "area"),
+        golden_area,
+        atol=1e-6,
+        rtol=0.0,
+    )
+    assert torch.equal(
+        reduce_primitive(image, target_width, target_height, "nearest"),
+        golden_nearest,
+    )
+    assert torch.equal(
+        reduce_primitive(image, target_width, target_height, "medoid"),
+        golden_medoid,
+    )
+
 def test_non_integer_reduction_supports_all_primitives():
     torch.manual_seed(4)
     image = torch.rand((1, 7, 11, 3), dtype=torch.float32)
