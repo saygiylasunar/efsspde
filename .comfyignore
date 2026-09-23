@@ -1,6 +1,1 @@
-.github/
-tests/
-ARCHITECTURE.md
-CHANGELOG.md
-GOLDEN_BASELINE.md
-LEARNED_DOWNSCALE.md
+.github/\ntests/\n
