@@ -1,608 +1,34 @@
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
-
 import torch
 import torch.nn.functional as F
 
-
-DEFAULT_PALETTE = """#00000000
-#18181B
-#3F3F46
-#71717A
-#F4F4F5
-#7C3AED
-#DB2777
-#DC2626
-#EA580C
-#EAB308
-#16A34A
-#0891B2
-#2563EB
-#A16207
-#D6A57A
-#8B5E3C"""
-
-HEX_PATTERN = re.compile(r"#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?")
+from .core import (
+    DEFAULT_PALETTE,
+    PRIMITIVE_METHODS,
+    PaletteSpec,
+    adaptive_resample,
+    consolidate_palette,
+    disciplined_downscale,
+    extract_palette_kmeans,
+    guide_rgb,
+    inspect_palette,
+    nearest_palette_indices,
+    palette_preview,
+    parse_palette,
+    reduce_primitive,
+    render_palette_indices,
+    validate_image,
+)
 
 
-@dataclass(frozen=True)
-class PaletteSpec:
-    hex_colors: tuple[str, ...]
-    rgba: torch.Tensor
-    transparent_index: int
-
-
-def _validate_image(image: torch.Tensor) -> None:
-    if image.ndim != 4 or image.shape[-1] != 3:
-        raise ValueError(f"Expected Comfy IMAGE [B,H,W,3], got {tuple(image.shape)}")
-
-
-def _parse_hex_color(value: str) -> tuple[float, float, float, float]:
-    raw = value.lstrip("#")
-    if len(raw) == 6:
-        raw += "FF"
-    channels = tuple(int(raw[index : index + 2], 16) / 255.0 for index in range(0, 8, 2))
-    return channels  # type: ignore[return-value]
-
-
-def _parse_palette(text: str) -> PaletteSpec:
-    colors = tuple(match.upper() for match in HEX_PATTERN.findall(text))
-    if len(colors) < 2:
-        raise ValueError("EFSS Palette requires at least two #RRGGBB or #RRGGBBAA colors.")
-    if len(colors) > 256:
-        raise ValueError("EFSS Palette supports at most 256 colors.")
-
-    rgba = torch.tensor([_parse_hex_color(color) for color in colors], dtype=torch.float32)
-    transparent = torch.where(rgba[:, 3] <= 0.001)[0]
-    transparent_index = int(transparent[0].item()) if len(transparent) else -1
-    return PaletteSpec(colors, rgba, transparent_index)
-
-
-def _palette_on(palette: PaletteSpec, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    return palette.rgba.to(device=device, dtype=dtype)
-
-
-def _palette_from_rgb(rgb: torch.Tensor) -> PaletteSpec:
-    rgb = rgb.detach().to(dtype=torch.float32).clamp(0.0, 1.0)
-    luma = rgb[:, 0] * 0.299 + rgb[:, 1] * 0.587 + rgb[:, 2] * 0.114
-    order = torch.argsort(luma)
-    rgb = rgb[order]
-
-    rgba = torch.cat(
-        [rgb, torch.ones((rgb.shape[0], 1), device=rgb.device, dtype=rgb.dtype)],
-        dim=1,
-    )
-    values = (rgb * 255.0).round().to(dtype=torch.uint8).cpu().tolist()
-    colors = tuple(f"#{r:02X}{g:02X}{b:02X}" for r, g, b in values)
-    return PaletteSpec(colors, rgba, -1)
-
-
-def _extract_palette_kmeans(
-    image: torch.Tensor,
-    color_count: int,
-    iterations: int,
-    sample_limit: int,
-) -> PaletteSpec:
-    _validate_image(image)
-    flat = image.reshape(-1, 3).to(dtype=torch.float32).clamp(0.0, 1.0)
-
-    if flat.shape[0] > sample_limit:
-        positions = torch.linspace(
-            0,
-            flat.shape[0] - 1,
-            steps=sample_limit,
-            device=flat.device,
-        ).round().to(dtype=torch.long)
-        flat = flat[positions]
-
-    k = max(2, min(int(color_count), int(flat.shape[0])))
-
-    mean = flat.mean(dim=0, keepdim=True)
-    first_index = ((flat - mean) ** 2).sum(dim=1).argmin()
-    centroids = [flat[first_index]]
-    min_distance = ((flat - centroids[0]) ** 2).sum(dim=1)
-
-    for _ in range(1, k):
-        next_index = min_distance.argmax()
-        next_centroid = flat[next_index]
-        centroids.append(next_centroid)
-        distance = ((flat - next_centroid) ** 2).sum(dim=1)
-        min_distance = torch.minimum(min_distance, distance)
-
-    centers = torch.stack(centroids, dim=0)
-
-    for _ in range(iterations):
-        distances = ((flat[:, None, :] - centers[None, :, :]) ** 2).sum(dim=-1)
-        labels = distances.argmin(dim=1)
-        updated = centers.clone()
-
-        for index in range(k):
-            members = flat[labels == index]
-            if members.numel() > 0:
-                updated[index] = members.mean(dim=0)
-
-        if torch.max(torch.abs(updated - centers)).item() < 1e-5:
-            centers = updated
-            break
-        centers = updated
-
-    return _palette_from_rgb(centers)
-
-
-def _resample_logical(
-    image: torch.Tensor,
-    target_width: int,
-    target_height: int,
-    mode: str,
-) -> torch.Tensor:
-    _validate_image(image)
-    _, source_height, source_width, _ = image.shape
-
-    if target_width <= 0 or target_height <= 0:
-        raise ValueError("Target dimensions must be positive.")
-
-    bchw = image.permute(0, 3, 1, 2)
-
-    if mode == "area":
-        sampled = F.interpolate(
-            bchw,
-            size=(target_height, target_width),
-            mode="area",
-        )
-        return sampled.permute(0, 2, 3, 1).contiguous().clamp(0.0, 1.0)
-
-    if mode == "nearest":
-        sampled = F.interpolate(
-            bchw,
-            size=(target_height, target_width),
-            mode="nearest",
-        )
-        return sampled.permute(0, 2, 3, 1).contiguous().clamp(0.0, 1.0)
-
-    if mode == "medoid":
-        if source_width % target_width != 0 or source_height % target_height != 0:
-            raise ValueError(
-                "medoid sampling requires source dimensions to be exact integer multiples "
-                f"of the target grid; got {source_width}x{source_height} -> "
-                f"{target_width}x{target_height}."
-            )
-
-        cell_width = source_width // target_width
-        cell_height = source_height // target_height
-        blocks = (
-            image.reshape(
-                image.shape[0],
-                target_height,
-                cell_height,
-                target_width,
-                cell_width,
-                3,
-            )
-            .permute(0, 1, 3, 2, 4, 5)
-            .reshape(
-                image.shape[0],
-                target_height,
-                target_width,
-                cell_height * cell_width,
-                3,
-            )
-        )
-
-        mean = blocks.mean(dim=3, keepdim=True)
-        distance = ((blocks - mean) ** 2).sum(dim=-1)
-        choice = distance.argmin(dim=3, keepdim=True)
-        gather_index = choice.unsqueeze(-1).expand(-1, -1, -1, 1, 3)
-        sampled = torch.gather(blocks, dim=3, index=gather_index).squeeze(3)
-        return sampled.contiguous().clamp(0.0, 1.0)
-
-    raise ValueError(f"Unsupported logical sampling mode: {mode}")
-
-
-
-def _adaptive_resample(
-    image: torch.Tensor,
-    target_width: int,
-    target_height: int,
-    profile: str,
-) -> torch.Tensor:
-    _validate_image(image)
-
-    area = _resample_logical(image, target_width, target_height, "area")
-    nearest = _resample_logical(image, target_width, target_height, "nearest")
-
-    _, source_height, source_width, _ = image.shape
-    exact_cells = source_width % target_width == 0 and source_height % target_height == 0
-    medoid = (
-        _resample_logical(image, target_width, target_height, "medoid")
-        if exact_cells
-        else nearest
-    )
-
-    # Per-cell color variance: high values mean texture / mixed colors inside the cell.
-    bchw = image.permute(0, 3, 1, 2)
-    mean = F.interpolate(bchw, size=(target_height, target_width), mode="area")
-    mean_sq = F.interpolate(bchw * bchw, size=(target_height, target_width), mode="area")
-    variance = (mean_sq - mean * mean).clamp_min(0.0).mean(dim=1)
-
-    # Logical edge strength from luma changes between neighboring target cells.
-    luma = (
-        area[..., 0] * 0.299
-        + area[..., 1] * 0.587
-        + area[..., 2] * 0.114
-    )
-    dx = torch.zeros_like(luma)
-    dy = torch.zeros_like(luma)
-    dx[:, :, 1:] = torch.abs(luma[:, :, 1:] - luma[:, :, :-1])
-    dy[:, 1:, :] = torch.abs(luma[:, 1:, :] - luma[:, :-1, :])
-    edge = torch.maximum(dx, dy)
-
-    profiles = {
-        "balanced": (0.045, 0.012, 0.095),
-        "outline": (0.025, 0.008, 0.060),
-        "sprite": (0.030, 0.009, 0.070),
-        "soft": (0.075, 0.020, 0.140),
-        "background": (0.090, 0.025, 0.170),
+def _legacy_indexed_payload(image: torch.Tensor) -> dict[str, object]:
+    return {
+        "version": 2,
+        "image": image,
+        "width": int(image.shape[2]),
+        "height": int(image.shape[1]),
     }
-    edge_threshold, variance_threshold, hard_edge_threshold = profiles.get(
-        profile, profiles["balanced"]
-    )
-
-    # Area owns smooth regions. Medoid owns mixed/structured cells. Nearest is
-    # reserved for the strongest hard transitions where contour placement matters most.
-    use_medoid = (edge >= edge_threshold) | (variance >= variance_threshold)
-    use_nearest = edge >= hard_edge_threshold
-
-    result = torch.where(use_medoid.unsqueeze(-1), medoid, area)
-    result = torch.where(use_nearest.unsqueeze(-1), nearest, result)
-    return result.contiguous().clamp(0.0, 1.0)
-
-
-def _logical_blocks(
-    image: torch.Tensor,
-    target_width: int,
-    target_height: int,
-) -> torch.Tensor | None:
-    _validate_image(image)
-    _, source_height, source_width, _ = image.shape
-    if source_width % target_width != 0 or source_height % target_height != 0:
-        return None
-
-    cell_width = source_width // target_width
-    cell_height = source_height // target_height
-    return (
-        image.reshape(
-            image.shape[0],
-            target_height,
-            cell_height,
-            target_width,
-            cell_width,
-            3,
-        )
-        .permute(0, 1, 3, 2, 4, 5)
-        .reshape(
-            image.shape[0],
-            target_height,
-            target_width,
-            cell_height * cell_width,
-            3,
-        )
-    )
-
-
-def _phase_candidate(
-    blocks: torch.Tensor,
-    cell_width: int,
-    cell_height: int,
-    phase_samples: int,
-) -> torch.Tensor:
-    if phase_samples <= 1:
-        ys = [0.5]
-        xs = [0.5]
-    elif phase_samples <= 4:
-        ys = [0.25, 0.75]
-        xs = [0.25, 0.75]
-    else:
-        ys = [1.0 / 6.0, 0.5, 5.0 / 6.0]
-        xs = [1.0 / 6.0, 0.5, 5.0 / 6.0]
-
-    indices: list[int] = []
-    for fy in ys:
-        y = min(cell_height - 1, max(0, int(round(fy * cell_height - 0.5))))
-        for fx in xs:
-            x = min(cell_width - 1, max(0, int(round(fx * cell_width - 0.5))))
-            index = y * cell_width + x
-            if index not in indices:
-                indices.append(index)
-
-    phase = blocks[..., indices, :]
-    mean = blocks.mean(dim=3, keepdim=True)
-    distance = ((phase - mean) ** 2).sum(dim=-1)
-    choice = distance.argmin(dim=3, keepdim=True)
-    gather_index = choice.unsqueeze(-1).expand(-1, -1, -1, 1, 3)
-    return torch.gather(phase, dim=3, index=gather_index).squeeze(3)
-
-
-def _candidate_stack(
-    image: torch.Tensor,
-    target_width: int,
-    target_height: int,
-    phase_samples: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    area = _resample_logical(image, target_width, target_height, "area")
-    nearest = _resample_logical(image, target_width, target_height, "nearest")
-    blocks = _logical_blocks(image, target_width, target_height)
-
-    if blocks is None:
-        candidates = torch.stack(
-            [area, nearest, nearest, area, nearest, nearest],
-            dim=0,
-        )
-    else:
-        mean = blocks.mean(dim=3, keepdim=True)
-        distance = ((blocks - mean) ** 2).sum(dim=-1)
-        choice = distance.argmin(dim=3, keepdim=True)
-        gather_index = choice.unsqueeze(-1).expand(-1, -1, -1, 1, 3)
-        medoid = torch.gather(blocks, dim=3, index=gather_index).squeeze(3)
-
-        median = blocks.median(dim=3).values
-
-        # Dominant-cluster candidate: mode of a coarse 5-bit RGB code, then use
-        # a real source pixel from that winning bin rather than the bin center.
-        quantized = (blocks.clamp(0.0, 1.0) * 31.0).round().to(dtype=torch.int64)
-        codes = quantized[..., 0] * 1024 + quantized[..., 1] * 32 + quantized[..., 2]
-        mode_result = torch.mode(codes, dim=3)
-        mode_index = mode_result.indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, 1, 3)
-        dominant = torch.gather(blocks, dim=3, index=mode_index).squeeze(3)
-
-        _, source_height, source_width, _ = image.shape
-        cell_width = source_width // target_width
-        cell_height = source_height // target_height
-        phase = _phase_candidate(blocks, cell_width, cell_height, phase_samples)
-
-        candidates = torch.stack(
-            [area, nearest, medoid, median, dominant, phase],
-            dim=0,
-        )
-
-    bchw = image.permute(0, 3, 1, 2)
-    mean = F.interpolate(bchw, size=(target_height, target_width), mode="area")
-    mean_sq = F.interpolate(bchw * bchw, size=(target_height, target_width), mode="area")
-    variance = (mean_sq - mean * mean).clamp_min(0.0).mean(dim=1)
-
-    luma = area[..., 0] * 0.299 + area[..., 1] * 0.587 + area[..., 2] * 0.114
-    dx = torch.zeros_like(luma)
-    dy = torch.zeros_like(luma)
-    dx[:, :, 1:] = torch.abs(luma[:, :, 1:] - luma[:, :, :-1])
-    dy[:, 1:, :] = torch.abs(luma[:, 1:, :] - luma[:, :-1, :])
-    edge = torch.maximum(dx, dy)
-    return candidates, edge, variance
-
-
-def _context_average(value: torch.Tensor, radius: int) -> torch.Tensor:
-    if radius <= 0:
-        return value
-    kernel = radius * 2 + 1
-    return F.avg_pool2d(
-        value.unsqueeze(1),
-        kernel_size=kernel,
-        stride=1,
-        padding=radius,
-    ).squeeze(1)
-
-
-def _disciplined_downscale(
-    image: torch.Tensor,
-    target_width: int,
-    target_height: int,
-    profile: str,
-    adaptive_strength: float,
-    contour_priority: float,
-    soft_depth: float,
-    source_fidelity: float,
-    edge_threshold: float,
-    variance_threshold: float,
-    context_radius: int,
-    phase_samples: int,
-    contour_lock: float,
-    noise_rejection: float,
-) -> torch.Tensor:
-    candidates, edge, variance = _candidate_stack(
-        image,
-        target_width=target_width,
-        target_height=target_height,
-        phase_samples=phase_samples,
-    )
-
-    edge_context = _context_average(edge, context_radius)
-    variance_context = _context_average(variance, context_radius)
-
-    edge_scale = max(float(edge_threshold), 1e-6)
-    variance_scale = max(float(variance_threshold), 1e-6)
-    edge_n = (edge_context / edge_scale).clamp(0.0, 2.0) * 0.5
-    variance_n = (variance_context / variance_scale).clamp(0.0, 2.0) * 0.5
-    smooth_n = (1.0 - torch.maximum(edge_n, variance_n)).clamp(0.0, 1.0)
-
-    # Method order:
-    # 0 area, 1 nearest, 2 medoid, 3 median, 4 dominant cluster, 5 phase sample.
-    scores = torch.zeros(
-        (6, image.shape[0], target_height, target_width),
-        device=image.device,
-        dtype=image.dtype,
-    )
-
-    adaptive = float(adaptive_strength)
-    contour = float(contour_priority)
-    soft = float(soft_depth)
-    fidelity = float(source_fidelity)
-    lock = float(contour_lock)
-    noise = float(noise_rejection)
-
-    scores[0] = (1.35 * soft * smooth_n) + (1.0 - adaptive) * 1.25
-    scores[1] = adaptive * contour * edge_n * (1.0 + 0.8 * lock)
-    scores[2] = adaptive * fidelity * (0.35 + 0.65 * torch.maximum(edge_n, variance_n))
-    scores[3] = adaptive * noise * variance_n * (0.35 + 0.65 * (1.0 - edge_n))
-    scores[4] = adaptive * (0.45 + 0.55 * noise) * variance_n * (0.55 + 0.45 * smooth_n)
-    scores[5] = adaptive * fidelity * (0.25 + 0.75 * edge_n) * (0.55 + 0.45 * contour)
-
-    profile_bias = {
-        "balanced": (1.00, 1.00, 1.00, 1.00, 1.00, 1.00),
-        "crisp": (0.70, 1.35, 1.20, 0.70, 0.90, 1.15),
-        "soft": (1.40, 0.55, 0.85, 1.10, 1.00, 0.75),
-        "sprite": (0.55, 1.35, 1.25, 0.65, 1.25, 1.20),
-        "portrait": (1.20, 0.75, 1.05, 1.10, 0.95, 0.90),
-    }.get(profile, (1.00, 1.00, 1.00, 1.00, 1.00, 1.00))
-
-    for index, bias in enumerate(profile_bias):
-        scores[index] *= bias
-
-    hard_edge = edge_n >= 0.5
-    scores[0] = torch.where(
-        hard_edge,
-        scores[0] * (1.0 - 0.75 * lock),
-        scores[0],
-    )
-    scores[3] = torch.where(
-        hard_edge,
-        scores[3] * (1.0 - 0.60 * lock),
-        scores[3],
-    )
-
-    choice = scores.argmax(dim=0)
-    gather_index = choice.unsqueeze(0).unsqueeze(-1).expand(1, -1, -1, -1, 3)
-    result = torch.gather(candidates, dim=0, index=gather_index).squeeze(0)
-    return result.contiguous().clamp(0.0, 1.0)
-
-
-def _nearest_palette_indices(
-    image: torch.Tensor,
-    palette: PaletteSpec,
-    metric: str,
-) -> torch.Tensor:
-    rgba = _palette_on(palette, image.device, image.dtype)
-    candidate_indices = torch.arange(rgba.shape[0], device=image.device)
-
-    if palette.transparent_index >= 0:
-        candidate_indices = candidate_indices[candidate_indices != palette.transparent_index]
-    if candidate_indices.numel() == 0:
-        raise ValueError("Palette must contain at least one non-transparent color.")
-
-    candidate_rgb = rgba[candidate_indices, :3]
-    flat = image.reshape(-1, 3)
-    weights = torch.tensor(
-        [0.299, 0.587, 0.114] if metric == "luma_weighted" else [1.0, 1.0, 1.0],
-        device=image.device,
-        dtype=image.dtype,
-    )
-
-    result: list[torch.Tensor] = []
-    chunk_size = 65_536
-    for start in range(0, flat.shape[0], chunk_size):
-        chunk = flat[start : start + chunk_size]
-        distance = ((chunk[:, None, :] - candidate_rgb[None, :, :]) ** 2 * weights).sum(dim=-1)
-        nearest = distance.argmin(dim=-1)
-        result.append(candidate_indices[nearest])
-
-    return torch.cat(result, dim=0).reshape(image.shape[0], image.shape[1], image.shape[2])
-
-
-def _render_palette_indices(
-    indices: torch.Tensor,
-    palette: PaletteSpec,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    rgba = _palette_on(palette, indices.device, torch.float32)
-    return rgba[:, :3][indices].clamp(0.0, 1.0).to(dtype=dtype)
-
-
-def _shift_image(
-    image: torch.Tensor,
-    dy: int,
-    dx: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    batch, height, width, channels = image.shape
-    shifted = torch.zeros_like(image)
-    valid = torch.zeros((batch, height, width), device=image.device, dtype=torch.bool)
-
-    src_y0 = max(0, -dy)
-    src_y1 = min(height, height - dy)
-    src_x0 = max(0, -dx)
-    src_x1 = min(width, width - dx)
-    dst_y0 = max(0, dy)
-    dst_y1 = min(height, height + dy)
-    dst_x0 = max(0, dx)
-    dst_x1 = min(width, width + dx)
-
-    if src_y1 > src_y0 and src_x1 > src_x0:
-        shifted[:, dst_y0:dst_y1, dst_x0:dst_x1, :] = image[:, src_y0:src_y1, src_x0:src_x1, :]
-        valid[:, dst_y0:dst_y1, dst_x0:dst_x1] = True
-
-    return shifted, valid
-
-
-def _guide_rgb(
-    image: torch.Tensor,
-    passes: int,
-    min_similar_neighbors: int,
-    similarity_threshold: float,
-) -> tuple[torch.Tensor, int]:
-    _validate_image(image)
-    work = image.clone()
-    changed_total = 0
-    offsets = [
-        (-1, -1), (-1, 0), (-1, 1),
-        (0, -1),             (0, 1),
-        (1, -1),  (1, 0),   (1, 1),
-    ]
-    weights = torch.tensor(
-        [0.299, 0.587, 0.114],
-        device=image.device,
-        dtype=image.dtype,
-    )
-    threshold_sq = float(similarity_threshold) ** 2
-
-    for _ in range(passes):
-        shifted_pairs = [_shift_image(work, dy, dx) for dy, dx in offsets]
-        neighbors = torch.stack([pair[0] for pair in shifted_pairs], dim=0)
-        valid = torch.stack([pair[1] for pair in shifted_pairs], dim=0)
-
-        current_distance = (
-            (neighbors - work.unsqueeze(0)) ** 2 * weights.view(1, 1, 1, 1, 3)
-        ).sum(dim=-1)
-        similar = valid & (current_distance <= threshold_sq)
-        similar_count = similar.sum(dim=0)
-        weak = similar_count < min_similar_neighbors
-
-        valid_float = valid.to(dtype=work.dtype).unsqueeze(-1)
-        neighbor_count = valid_float.sum(dim=0).clamp_min(1.0)
-        mean = (neighbors * valid_float).sum(dim=0) / neighbor_count
-
-        candidate_distance = (
-            (neighbors - mean.unsqueeze(0)) ** 2 * weights.view(1, 1, 1, 1, 3)
-        ).sum(dim=-1)
-        candidate_distance = torch.where(
-            valid,
-            candidate_distance,
-            torch.full_like(candidate_distance, float("inf")),
-        )
-        choice = candidate_distance.argmin(dim=0)
-        gather_index = choice.unsqueeze(0).unsqueeze(-1).expand(1, -1, -1, -1, 3)
-        replacement = torch.gather(neighbors, dim=0, index=gather_index).squeeze(0)
-
-        replacement_distance = (
-            (replacement - work) ** 2 * weights.view(1, 1, 1, 3)
-        ).sum(dim=-1)
-        change_mask = weak & (replacement_distance > 1e-10)
-
-        changed = int(change_mask.sum().item())
-        if changed == 0:
-            break
-
-        work = torch.where(change_mask.unsqueeze(-1), replacement, work)
-        changed_total += changed
-
-    return work.clamp(0.0, 1.0), changed_total
 
 
 class EFSSPixelCanvas:
@@ -632,6 +58,42 @@ class EFSSPixelCanvas:
                 "Choose a different cell_scale or target grid."
             )
         return (generation_width, generation_height, target_width, target_height, cell_scale)
+
+
+class EFSSPrimitiveDownscale:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "target_width": ("INT", {"default": 72, "min": 1, "max": 2048, "step": 1}),
+                "target_height": ("INT", {"default": 90, "min": 1, "max": 2048, "step": 1}),
+                "method": (list(PRIMITIVE_METHODS), {"default": "medoid"}),
+                "phase_samples": (["1", "4", "9"], {"default": "4"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "downscale"
+    CATEGORY = "EFSS PDE"
+
+    def downscale(
+        self,
+        image: torch.Tensor,
+        target_width: int,
+        target_height: int,
+        method: str,
+        phase_samples: str,
+    ):
+        output = reduce_primitive(
+            image,
+            target_width=target_width,
+            target_height=target_height,
+            method=method,
+            phase_samples=int(phase_samples),
+        )
+        return (output.to(dtype=image.dtype),)
 
 
 class EFSSDisciplinedDownscale:
@@ -708,7 +170,7 @@ class EFSSDisciplinedDownscale:
         contour_lock: float,
         noise_rejection: float,
     ):
-        output = _disciplined_downscale(
+        output = disciplined_downscale(
             image,
             target_width=target_width,
             target_height=target_height,
@@ -728,6 +190,8 @@ class EFSSDisciplinedDownscale:
 
 
 class EFSSPixelMap:
+    """Compatibility/advanced node. Prefer Primitive or Disciplined Downscale for new graphs."""
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -735,13 +199,22 @@ class EFSSPixelMap:
                 "image": ("IMAGE",),
                 "target_width": ("INT", {"default": 32, "min": 1, "max": 2048, "step": 1}),
                 "target_height": ("INT", {"default": 32, "min": 1, "max": 2048, "step": 1}),
-                "sampling": (["adaptive", "medoid", "area", "nearest"], {"default": "adaptive"}),
-                "profile": (["balanced", "outline", "sprite", "soft", "background"], {"default": "balanced"}),
-            }
+                "sampling": (
+                    ["adaptive", "medoid", "area", "nearest", "median", "dominant", "phase"],
+                    {"default": "adaptive"},
+                ),
+                "profile": (
+                    ["balanced", "outline", "sprite", "soft", "background"],
+                    {"default": "balanced"},
+                ),
+            },
+            "optional": {
+                "phase_samples": (["1", "4", "9"], {"default": "4"}),
+            },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("pixel_image",)
+    RETURN_TYPES = ("IMAGE", "EFSS_INDEXED")
+    RETURN_NAMES = ("pixel_image", "legacy_indexed")
     FUNCTION = "map_pixels"
     CATEGORY = "EFSS PDE/Advanced"
 
@@ -752,22 +225,28 @@ class EFSSPixelMap:
         target_height: int,
         sampling: str,
         profile: str,
+        phase_samples: str = "4",
+        palette=None,
+        **legacy_inputs,
     ):
         if sampling == "adaptive":
-            sampled = _adaptive_resample(
+            sampled = adaptive_resample(
                 image,
                 target_width=target_width,
                 target_height=target_height,
                 profile=profile,
+                phase_samples=int(phase_samples),
             )
         else:
-            sampled = _resample_logical(
+            sampled = reduce_primitive(
                 image,
                 target_width=target_width,
                 target_height=target_height,
-                mode=sampling,
+                method=sampling,
+                phase_samples=int(phase_samples),
             )
-        return (sampled.to(dtype=image.dtype),)
+        sampled = sampled.to(dtype=image.dtype)
+        return (sampled, _legacy_indexed_payload(sampled))
 
 
 class EFSSPixelGuide:
@@ -793,8 +272,10 @@ class EFSSPixelGuide:
         passes: int,
         min_similar_neighbors: int,
         similarity_threshold: float,
+        indexed=None,
+        **legacy_inputs,
     ):
-        guided, changed = _guide_rgb(
+        guided, changed = guide_rgb(
             image,
             passes=passes,
             min_similar_neighbors=min_similar_neighbors,
@@ -819,7 +300,7 @@ class EFSSPixelPreview:
     CATEGORY = "EFSS PDE/Pixel"
 
     def preview(self, image: torch.Tensor, scale: int):
-        _validate_image(image)
+        validate_image(image)
         bchw = image.permute(0, 3, 1, 2)
         output = F.interpolate(bchw, scale_factor=scale, mode="nearest")
         return (output.permute(0, 2, 3, 1).contiguous(),)
@@ -832,10 +313,7 @@ class EFSSPalette:
             "required": {
                 "palette_text": (
                     "STRING",
-                    {
-                        "multiline": True,
-                        "default": DEFAULT_PALETTE,
-                    },
+                    {"multiline": True, "default": DEFAULT_PALETTE},
                 ),
             }
         }
@@ -843,10 +321,10 @@ class EFSSPalette:
     RETURN_TYPES = ("EFSS_PALETTE", "INT", "STRING")
     RETURN_NAMES = ("palette", "color_count", "normalized_hex")
     FUNCTION = "build"
-    CATEGORY = "EFSS PDE/Advanced"
+    CATEGORY = "EFSS PDE/Palette"
 
     def build(self, palette_text: str):
-        palette = _parse_palette(palette_text)
+        palette = parse_palette(palette_text)
         return (palette, len(palette.hex_colors), "\n".join(palette.hex_colors))
 
 
@@ -864,15 +342,10 @@ class EFSSAutoPalette:
     RETURN_TYPES = ("EFSS_PALETTE", "INT", "STRING")
     RETURN_NAMES = ("palette", "color_count", "normalized_hex")
     FUNCTION = "extract"
-    CATEGORY = "EFSS PDE/Advanced"
+    CATEGORY = "EFSS PDE/Palette"
 
-    def extract(
-        self,
-        image: torch.Tensor,
-        color_count: int,
-        iterations: int,
-    ):
-        palette = _extract_palette_kmeans(
+    def extract(self, image: torch.Tensor, color_count: int, iterations: int):
+        palette = extract_palette_kmeans(
             image,
             color_count=color_count,
             iterations=iterations,
@@ -895,21 +368,76 @@ class EFSSPaletteQuantize:
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("quantized_image",)
     FUNCTION = "quantize"
-    CATEGORY = "EFSS PDE/Advanced"
+    CATEGORY = "EFSS PDE/Palette"
 
-    def quantize(
-        self,
-        image: torch.Tensor,
-        palette: PaletteSpec,
-        distance_metric: str,
-    ):
-        _validate_image(image)
-        indices = _nearest_palette_indices(image, palette, distance_metric)
-        return (_render_palette_indices(indices, palette, image.dtype),)
+    def quantize(self, image: torch.Tensor, palette: PaletteSpec, distance_metric: str):
+        indices = nearest_palette_indices(image, palette, distance_metric)
+        return (render_palette_indices(indices, palette, image.dtype),)
+
+
+class EFSSPaletteInspector:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "max_colors_report": ("INT", {"default": 64, "min": 1, "max": 256, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("INT", "STRING", "STRING")
+    RETURN_NAMES = ("unique_color_count", "hex_palette", "usage_report")
+    FUNCTION = "inspect"
+    CATEGORY = "EFSS PDE/Palette"
+
+    def inspect(self, image: torch.Tensor, max_colors_report: int):
+        return inspect_palette(image, max_colors_report=max_colors_report)
+
+
+class EFSSPalettePreview:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "palette": ("EFSS_PALETTE",),
+                "swatch_size": ("INT", {"default": 24, "min": 4, "max": 128, "step": 1}),
+                "columns": ("INT", {"default": 8, "min": 1, "max": 32, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("swatch_image",)
+    FUNCTION = "preview"
+    CATEGORY = "EFSS PDE/Palette"
+
+    def preview(self, palette: PaletteSpec, swatch_size: int, columns: int):
+        return (palette_preview(palette, swatch_size=swatch_size, columns=columns),)
+
+
+class EFSSPaletteConsolidate:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "palette": ("EFSS_PALETTE",),
+                "threshold": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.005}),
+                "distance_metric": (["luma_weighted", "rgb"], {"default": "luma_weighted"}),
+            }
+        }
+
+    RETURN_TYPES = ("EFSS_PALETTE", "INT", "STRING")
+    RETURN_NAMES = ("palette", "color_count", "normalized_hex")
+    FUNCTION = "consolidate"
+    CATEGORY = "EFSS PDE/Palette"
+
+    def consolidate(self, palette: PaletteSpec, threshold: float, distance_metric: str):
+        merged = consolidate_palette(palette, threshold=threshold, metric=distance_metric)
+        return (merged, len(merged.hex_colors), "\n".join(merged.hex_colors))
 
 
 NODE_CLASS_MAPPINGS = {
     "EFSSPDE_PixelCanvas": EFSSPixelCanvas,
+    "EFSSPDE_PrimitiveDownscale": EFSSPrimitiveDownscale,
     "EFSSPDE_DisciplinedDownscale": EFSSDisciplinedDownscale,
     "EFSSPDE_PixelMap": EFSSPixelMap,
     "EFSSPDE_PixelGuide": EFSSPixelGuide,
@@ -917,15 +445,22 @@ NODE_CLASS_MAPPINGS = {
     "EFSSPDE_Palette": EFSSPalette,
     "EFSSPDE_AutoPalette": EFSSAutoPalette,
     "EFSSPDE_PaletteQuantize": EFSSPaletteQuantize,
+    "EFSSPDE_PaletteInspector": EFSSPaletteInspector,
+    "EFSSPDE_PalettePreview": EFSSPalettePreview,
+    "EFSSPDE_PaletteConsolidate": EFSSPaletteConsolidate,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "EFSSPDE_PixelCanvas": "EFSS Pixel Canvas",
+    "EFSSPDE_PrimitiveDownscale": "EFSS Primitive Downscale",
     "EFSSPDE_DisciplinedDownscale": "EFSS Disciplined Downscale",
-    "EFSSPDE_PixelMap": "EFSS Pixel Map",
+    "EFSSPDE_PixelMap": "EFSS Pixel Map (Compatibility)",
     "EFSSPDE_PixelGuide": "EFSS Pixel Guide",
     "EFSSPDE_PixelPreview": "EFSS Pixel Preview",
     "EFSSPDE_Palette": "EFSS Palette",
     "EFSSPDE_AutoPalette": "EFSS Auto Palette",
     "EFSSPDE_PaletteQuantize": "EFSS Palette Quantize",
+    "EFSSPDE_PaletteInspector": "EFSS Palette Inspector",
+    "EFSSPDE_PalettePreview": "EFSS Palette Preview",
+    "EFSSPDE_PaletteConsolidate": "EFSS Palette Consolidate",
 }
