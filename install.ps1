@@ -28,7 +28,7 @@ if (Test-Path $target) {
 
 New-Item -ItemType Directory -Path $target | Out-Null
 
-foreach ($file in @("__init__.py", "nodes.py", "pyproject.toml", "README.md")) {
+foreach ($file in @("__init__.py", "core.py", "nodes.py", "pyproject.toml", "README.md")) {
     Copy-Item (Join-Path $source $file) (Join-Path $target $file) -Force
 }
 
