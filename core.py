@@ -156,34 +156,28 @@ def extract_palette_kmeans(
     return palette_from_rgb(centers)
 
 
-def _partition_bounds(source_length: int, target_length: int) -> list[tuple[int, int]]:
+def _axis_partition(
+    source_length: int,
+    target_length: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
     if target_length <= 0 or target_length > source_length:
         raise ValueError(
             f"Cannot partition source length {source_length} into {target_length} non-empty logical cells."
         )
-    return [
-        ((index * source_length) // target_length, ((index + 1) * source_length) // target_length)
-        for index in range(target_length)
-    ]
+    indices = torch.arange(target_length + 1, device=device, dtype=torch.int64)
+    bounds = (indices * source_length) // target_length
+    starts = bounds[:-1]
+    sizes = bounds[1:] - bounds[:-1]
+    return starts, sizes
 
 
-def _phase_indices(height: int, width: int, phase_samples: int) -> list[int]:
+def _phase_fractions(phase_samples: int) -> tuple[float, ...]:
     if phase_samples <= 1:
-        fractions = (0.5,)
-    elif phase_samples <= 4:
-        fractions = (0.25, 0.75)
-    else:
-        fractions = (1.0 / 6.0, 0.5, 5.0 / 6.0)
-
-    indices: list[int] = []
-    for fy in fractions:
-        y = min(height - 1, max(0, int(round(fy * height - 0.5))))
-        for fx in fractions:
-            x = min(width - 1, max(0, int(round(fx * width - 0.5))))
-            index = y * width + x
-            if index not in indices:
-                indices.append(index)
-    return indices
+        return (0.5,)
+    if phase_samples <= 4:
+        return (0.25, 0.75)
+    return (1.0 / 6.0, 0.5, 5.0 / 6.0)
 
 
 def _logical_candidate_bundle(
@@ -194,42 +188,117 @@ def _logical_candidate_bundle(
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
     validate_target(image, target_width, target_height)
     batch, source_height, source_width, _ = image.shape
-    y_bounds = _partition_bounds(source_height, target_height)
-    x_bounds = _partition_bounds(source_width, target_width)
+    device = image.device
 
-    shape = (batch, target_height, target_width, 3)
-    area = torch.empty(shape, device=image.device, dtype=image.dtype)
-    medoid = torch.empty_like(area)
-    median = torch.empty_like(area)
-    dominant = torch.empty_like(area)
-    phase = torch.empty_like(area)
-    variance = torch.empty((batch, target_height, target_width), device=image.device, dtype=image.dtype)
+    y_starts, cell_heights = _axis_partition(source_height, target_height, device)
+    x_starts, cell_widths = _axis_partition(source_width, target_width, device)
+    max_height = int(cell_heights.max().item())
+    max_width = int(cell_widths.max().item())
 
-    for oy, (y0, y1) in enumerate(y_bounds):
-        for ox, (x0, x1) in enumerate(x_bounds):
-            region = image[:, y0:y1, x0:x1, :].reshape(batch, -1, 3)
-            mean = region.mean(dim=1, keepdim=True)
-            area[:, oy, ox, :] = mean.squeeze(1)
-            variance[:, oy, ox] = ((region - mean) ** 2).mean(dim=(1, 2))
+    y_offsets = torch.arange(max_height, device=device, dtype=torch.int64)
+    x_offsets = torch.arange(max_width, device=device, dtype=torch.int64)
 
-            distance = ((region - mean) ** 2).sum(dim=-1)
-            medoid_index = distance.argmin(dim=1)
-            medoid[:, oy, ox, :] = region[torch.arange(batch, device=image.device), medoid_index]
+    y_indices = (y_starts[:, None] + y_offsets[None, :]).clamp(max=source_height - 1)
+    x_indices = (x_starts[:, None] + x_offsets[None, :]).clamp(max=source_width - 1)
+    y_valid = y_offsets[None, :] < cell_heights[:, None]
+    x_valid = x_offsets[None, :] < cell_widths[:, None]
 
-            median[:, oy, ox, :] = region.median(dim=1).values
+    y_grid = y_indices[:, None, :, None].expand(
+        target_height, target_width, max_height, max_width
+    )
+    x_grid = x_indices[None, :, None, :].expand(
+        target_height, target_width, max_height, max_width
+    )
 
-            quantized = (region.clamp(0.0, 1.0) * 31.0).round().to(dtype=torch.int64)
-            codes = quantized[..., 0] * 1024 + quantized[..., 1] * 32 + quantized[..., 2]
-            mode_index = torch.mode(codes, dim=1).indices
-            dominant[:, oy, ox, :] = region[torch.arange(batch, device=image.device), mode_index]
+    cell_size = max_height * max_width
+    blocks = image[:, y_grid, x_grid, :].reshape(
+        batch, target_height, target_width, cell_size, 3
+    )
+    valid = (
+        y_valid[:, None, :, None] & x_valid[None, :, None, :]
+    ).reshape(target_height, target_width, cell_size)
+    valid_batch = valid.unsqueeze(0)
+    valid_rgb = valid_batch.unsqueeze(-1)
 
-            region_height = y1 - y0
-            region_width = x1 - x0
-            indices = _phase_indices(region_height, region_width, phase_samples)
-            phase_pool = region[:, indices, :]
-            phase_distance = ((phase_pool - mean) ** 2).sum(dim=-1)
-            phase_index = phase_distance.argmin(dim=1)
-            phase[:, oy, ox, :] = phase_pool[torch.arange(batch, device=image.device), phase_index]
+    counts = valid.sum(dim=-1).clamp_min(1).to(dtype=image.dtype)
+    mean = (blocks * valid_rgb).sum(dim=3) / counts.unsqueeze(0).unsqueeze(-1)
+    centered = blocks - mean.unsqueeze(3)
+    variance = (
+        (centered * centered * valid_rgb).sum(dim=(3, 4))
+        / (counts.unsqueeze(0) * 3.0)
+    )
+
+    distance = (centered * centered).sum(dim=-1)
+    distance = distance.masked_fill(~valid_batch, float("inf"))
+    medoid_index = distance.argmin(dim=3)
+    medoid = torch.gather(
+        blocks,
+        dim=3,
+        index=medoid_index.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, 1, 3),
+    ).squeeze(3)
+
+    sortable = blocks.masked_fill(~valid_rgb, float("inf"))
+    sorted_values = torch.sort(sortable, dim=3).values
+    median_index = ((valid.sum(dim=-1) - 1) // 2).to(dtype=torch.long)
+    median = torch.gather(
+        sorted_values,
+        dim=3,
+        index=median_index.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).expand(
+            batch, target_height, target_width, 1, 3
+        ),
+    ).squeeze(3)
+
+    quantized = (blocks.clamp(0.0, 1.0) * 31.0).round().to(dtype=torch.int64)
+    codes = quantized[..., 0] * 1024 + quantized[..., 1] * 32 + quantized[..., 2]
+    invalid_codes = 32768 + torch.arange(cell_size, device=device, dtype=torch.int64)
+    codes = torch.where(
+        valid_batch,
+        codes,
+        invalid_codes.view(1, 1, 1, cell_size),
+    )
+    dominant_index = torch.mode(codes, dim=3).indices
+    dominant = torch.gather(
+        blocks,
+        dim=3,
+        index=dominant_index.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, 1, 3),
+    ).squeeze(3)
+
+    fractions = _phase_fractions(phase_samples)
+    fraction_tensor = torch.tensor(fractions, device=device, dtype=torch.float32)
+
+    phase_y_offsets = (
+        cell_heights[:, None].to(dtype=torch.float32) * fraction_tensor[None, :] - 0.5
+    ).round().to(dtype=torch.int64)
+    phase_x_offsets = (
+        cell_widths[:, None].to(dtype=torch.float32) * fraction_tensor[None, :] - 0.5
+    ).round().to(dtype=torch.int64)
+    phase_y_offsets = torch.minimum(
+        torch.maximum(phase_y_offsets, torch.zeros_like(phase_y_offsets)),
+        cell_heights[:, None] - 1,
+    )
+    phase_x_offsets = torch.minimum(
+        torch.maximum(phase_x_offsets, torch.zeros_like(phase_x_offsets)),
+        cell_widths[:, None] - 1,
+    )
+
+    phase_y = y_starts[:, None] + phase_y_offsets
+    phase_x = x_starts[:, None] + phase_x_offsets
+    phase_axis_count = len(fractions)
+    phase_y_grid = phase_y[:, None, :, None].expand(
+        target_height, target_width, phase_axis_count, phase_axis_count
+    ).reshape(target_height, target_width, -1)
+    phase_x_grid = phase_x[None, :, None, :].expand(
+        target_height, target_width, phase_axis_count, phase_axis_count
+    ).reshape(target_height, target_width, -1)
+
+    phase_pool = image[:, phase_y_grid, phase_x_grid, :]
+    phase_distance = ((phase_pool - mean.unsqueeze(3)) ** 2).sum(dim=-1)
+    phase_index = phase_distance.argmin(dim=3)
+    phase = torch.gather(
+        phase_pool,
+        dim=3,
+        index=phase_index.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, 1, 3),
+    ).squeeze(3)
 
     bchw = image.permute(0, 3, 1, 2)
     nearest = F.interpolate(
@@ -238,7 +307,7 @@ def _logical_candidate_bundle(
         mode="nearest",
     ).permute(0, 2, 3, 1).contiguous().clamp(0.0, 1.0)
 
-    luma = area[..., 0] * 0.299 + area[..., 1] * 0.587 + area[..., 2] * 0.114
+    luma = mean[..., 0] * 0.299 + mean[..., 1] * 0.587 + mean[..., 2] * 0.114
     dx = torch.zeros_like(luma)
     dy = torch.zeros_like(luma)
     dx[:, :, 1:] = torch.abs(luma[:, :, 1:] - luma[:, :, :-1])
@@ -246,7 +315,7 @@ def _logical_candidate_bundle(
     edge = torch.maximum(dx, dy)
 
     return {
-        "area": area.clamp(0.0, 1.0),
+        "area": mean.clamp(0.0, 1.0),
         "nearest": nearest,
         "medoid": medoid.clamp(0.0, 1.0),
         "median": median.clamp(0.0, 1.0),
