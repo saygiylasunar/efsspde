@@ -1,10 +1,14 @@
 [project]
 name = "efsspde-nodes"
-version = "0.1.0"
-description = "Deterministic pixel mapping and guiding nodes for EFSS PDE workflows."
+version = "0.2.0"
+description = "Deterministic, structure-aware pixel reduction and palette nodes for ComfyUI."
 requires-python = ">=3.10"
 dependencies = []
 
 [project.urls]
 Repository = "https://github.com/saygiylasunar/efsspde"
-Documentation = "https://github.com/saygiylasunar/efsspde/tree/feat/comfy-node-pack-clean"
+Documentation = "https://github.com/saygiylasunar/efsspde#readme"
+
+[tool.comfy]
+PublisherId = "saygiylasunar"
+DisplayName = "EFSS PDE"
