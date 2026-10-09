@@ -3,8 +3,10 @@ name: Comfy Nodes CI
 on:
   push:
     branches:
+      - main
       - feat/comfy-node-pack-clean
   pull_request:
+  workflow_dispatch:
 
 jobs:
   python:
@@ -16,3 +18,7 @@ jobs:
           python-version: "3.12"
       - name: Compile node package
         run: python -m compileall -q .
+      - name: Install PyTorch CPU (standalone node tests)
+        run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Test deterministic reduction contracts
+        run: python -m unittest discover -s tests -v
